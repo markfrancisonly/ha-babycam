@@ -496,6 +496,8 @@ class WebRTCsession {
             });
             return;
         }
+        
+        //todo: WebRTCsession.enablePinchZoom();
 
         if (card.isVisibleInViewport || this.background) {
             setTimeout(() => {
@@ -594,6 +596,41 @@ class WebRTCsession {
         WebRTCsession.globalStats = !WebRTCsession.globalStats;
         console.debug(`Global stats mode ${WebRTCsession.globalStats ? 'enabled' : 'disabled'}`); 
     }
+
+    // static enablePinchZoom() {
+    //     let viewport = document.querySelector("meta[name=viewport]");
+    //     if (!viewport) {
+    //         viewport = document.createElement("meta");
+    //         viewport.setAttribute("name", "viewport");
+    //         viewport.setAttribute("content", "width=device-width, viewport-fit=cover");
+    //         document.head.appendChild(viewport);
+    //     }
+
+    //     if (!WebRTCsession.defaultViewportContent) {
+    //         const mediaQueryList = window.matchMedia("(orientation: portrait)");
+    //         mediaQueryList.addEventListener('change', () => WebRTCsession.resetPinchZoomScale());
+    //         WebRTCsession.defaultViewportContent = viewport.getAttribute('content');
+    //     }
+
+    //     WebRTCsession.resetPinchZoomScale();
+    //     viewport.setAttribute('content', "initial-scale=1.0, minimum-scale=1.0, maximum-scale=5.0");
+    // }
+
+    // static resetPinchZoomScale() {
+    //     const viewport = document.querySelector("meta[name=viewport]");
+    //     if (!viewport) return;
+    //     const content = viewport.getAttribute('content');
+    //     viewport.setAttribute('content', "initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0");
+    //     viewport.setAttribute('content', content);
+    // }
+
+    // static restorePinchZoomDefaults() {
+    //     WebRTCsession.resetPinchZoomScale();
+    //     const viewport = document.querySelector("meta[name=viewport]");
+    //     if (viewport && WebRTCsession.defaultViewportContent) {
+    //         viewport.setAttribute("content", WebRTCsession.defaultViewportContent);
+    //     }
+    // }
 
     get status() {
         return this.state.status;
@@ -1737,11 +1774,11 @@ class WebRTCbabycam extends HTMLElement {
                 break;
 
             case 'remotestream':
-                //this.loadRemoteStream();
+                // todo: revisit this.loadRemoteStream();
                 break;
             case 'backgroundchange':
                 if (!ev.detail.background) {
-                    // todo: optionally close invisible background card
+                    this.handleVisibilityChange(this.isVisibleInViewport, false);
                 }
                 this.updateVolume();
                 break;
@@ -3364,3 +3401,4 @@ class RTSPtoWebSignalingChannel extends SignalingChannel {
         }
     }
 }
+
