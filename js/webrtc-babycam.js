@@ -1778,7 +1778,11 @@ class WebRTCbabycam extends HTMLElement {
                 break;
             case 'backgroundchange':
                 if (!ev.detail.background) {
-                    this.handleVisibilityChange(this.isVisibleInViewport, false);
+                    [...this.session.state.cards].forEach(otherCard => {
+                        if (otherCard !== this && otherCard.isVisibleInViewport === false) {
+                            otherCard.handleVisibilityChange(false, false);
+                        }
+                    });
                 }
                 this.updateVolume();
                 break;
@@ -2395,7 +2399,6 @@ class WebRTCbabycam extends HTMLElement {
         {
             [...this.session.state.cards].forEach(otherCard => {
                 if (otherCard !== this && otherCard.isVisibleInViewport === false) {
-                    debugger;
                     otherCard.handleVisibilityChange(false, false);
                 }
             });
