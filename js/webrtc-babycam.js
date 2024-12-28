@@ -1189,11 +1189,12 @@ class WebRTCbabycam extends HTMLElement {
         const log = this.shadowRoot.querySelector('.log');
         if (!log) return;
 
+        const session = this.session;
         if (show) {            
             log.classList.remove('hidden');
 
-            if (this.session && this.session.tracing !== true)
-                this.session.tracing = true;
+            if (session && session.tracing !== true)
+                session.tracing = true;
         }
         else {
             log.classList.add('hidden');
@@ -1408,8 +1409,6 @@ class WebRTCbabycam extends HTMLElement {
         </ha-card>
         `;
 
-        
-        //this._cardMedia = this.createMedia(this.config.video, this.config.muted, this.session.background)();
         const container = this.shadowRoot.querySelector('.media-container');
 
         this._cardMedia = this.createMedia(video, muted, background);
@@ -1906,34 +1905,38 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     execute(action, params) {
-        switch (action) {
- 
+        
+        const session = this.session;
+        const media = this.media;
 
+        switch (action) {
             case 'fullscreen':
                 this.toggleFullScreen();
                 break;
 
             case 'microphone':
-                this.session.microphone = !this.session.microphone;
+                if (session) {
+                    session.microphone = !this.session.microphone;
+                }
                 break;
 
             case 'play':
                 // e.g. un-pause or un-mute local media
-                if (this.media?.paused) {
-                    this.media.play().catch(err => this.trace(err.message));
+                if (media?.paused) {
+                    media.play().catch(err => this.trace(err.message));
                 }
                 break;
 
             case 'ptz':
-                if (params && params.domain && params.service) {
-                    this.session.hass.callService(params.domain, params.service, params.data);
-                    setTimeout(() => { this.session?.fetchImage(); }, 2000);
+                if (session && params && params.domain && params.service) {
+                    session.hass.callService(params.domain, params.service, params.data);
+                    setTimeout(() => { session?.fetchImage(); }, 2000);
                 }
                 break;
 
             case 'shortcut':
-                if (params && params.domain && params.service) {
-                    this.session.hass.callService(params.domain, params.service, params.data);
+                if (session && params && params.domain && params.service) {
+                    session.hass.callService(params.domain, params.service, params.data);
                 }
                 break;
 
@@ -2041,17 +2044,20 @@ class WebRTCbabycam extends HTMLElement {
             // pure image mode => no streaming icon
             return;
         }
-        const status = this.session?.status;
+        const session = this.session;
+        const status = session?.status;
+        const error = session?.lastError;
+
         const media = this.media;
         const playing = this.isPlaying;
         const doesntplay = this.config.video === false && this.config.audio === false;
         const paused = this.isPaused;
-        const error = this.session?.lastError;
 
         const waitedTooLong = WebRTCsession.TIMEOUT_RENDERING;
         let iconToShow = null;
 
         switch (status) {
+            case undefined:
             case null:
                 this.waitStartDate = Date.now();
                 this.setStateIcon("mdi:heart-broken", true);
@@ -2091,7 +2097,7 @@ class WebRTCbabycam extends HTMLElement {
 
             const showStats = WebRTCsession.globalStats || (this.config.stats && WebRTCsession.globalStats !== false);
             if (showStats) {
-                this.header = this.session?.state?.statistics ?? "";
+                this.header = session?.state?.statistics ?? "";
             }
             else {
                 this.header = "";
@@ -2103,9 +2109,9 @@ class WebRTCbabycam extends HTMLElement {
             iconToShow = (media?.tagName === 'AUDIO') ? "mdi:volume-off" : "mdi:pause";
         }
 
-        if (this.session.isStreaming) {
-            if (media?.tagName == 'AUDIO') {
-                if (this.session.background) 
+        if (session?.isStreaming) {
+            if (media.tagName == 'AUDIO') {
+                if (session.background) 
                     this.setStateIcon("mdi:pin", true);
                 else if (media.muted && this.config.muted === false) 
                     this.setStateIcon(iconToShow, true);
@@ -2119,7 +2125,7 @@ class WebRTCbabycam extends HTMLElement {
                         break;
 
                     case 'video':
-                        if (this.session.background) 
+                        if (session.background) 
                             this.setStateIcon("mdi:pin", true);
                         else
                             this.setStateIcon(iconToShow, false);
@@ -2128,7 +2134,7 @@ class WebRTCbabycam extends HTMLElement {
                     case 'audiovideo':
                         if (media.muted && this.config.muted === false) 
                             this.setStateIcon("mdi:volume-mute", true);
-                        else if (this.session.background) 
+                        else if (session.background) 
                             this.setStateIcon("mdi:pin", true);
                         else if (!media.muted && this.config.muted === true) 
                                 this.setStateIcon("mdi:volume-high", true);
@@ -2178,16 +2184,17 @@ class WebRTCbabycam extends HTMLElement {
         if (!volume) return;
     
         let icon = null; 
+        const session = this.session;
     
-        if (!this.session || !this.session.isStreaming) {
+        if (!session || !session.isStreaming) {
             // No icon to display without an active stream 
             icon = null; 
         }
-        else if (this.session.background) {
+        else if (session.background) {
             // Background mode enabled
             icon = 'mdi:pin';
         }
-        else if (this.config.audio === false || (this.session.isStreaming && !this.session.isStreamingAudio)) {
+        else if (this.config.audio === false || (session.isStreaming && !session.isStreamingAudio)) {
             // No audio stream available
             
             if (this.config.background || this.config.allow_background)
@@ -2197,14 +2204,14 @@ class WebRTCbabycam extends HTMLElement {
         else if (this.media.tagName === 'AUDIO') {
             // Audio only media
             
-            if (this.media.muted || !this.session.isStreamingAudio)  
+            if (this.media.muted || !session.isStreamingAudio)  
                 // Muted or not active stream
                 icon = 'mdi:volume-off';
             else
                 // Unmuted audio
                 icon = 'mdi:volume-high';
         }
-        else if (this.session.isStreaming) {
+        else if (session.isStreaming) {
             // Video stream with audio
 
             if (this.media.muted)
@@ -2222,7 +2229,7 @@ class WebRTCbabycam extends HTMLElement {
     }
     
     updateMicrophone() {
-        const enabled = this.session.microphone;
+        const enabled = this.session?.microphone;
         const mic = this.shadowRoot.querySelector('.microphone');
         if (!mic) return;
         if (enabled) {
@@ -2234,12 +2241,13 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     trace(text, o) {
-        if (this.session?.tracing === false)
+        const session = this.session;
+        if (session?.tracing === false)
             return;
 
         text = `${this.instanceId} ${text}`;
-        if (this.session)  {
-            this.session.trace(text, o);
+        if (session)  {
+            session.trace(text, o);
         }
         else
         {
@@ -2253,22 +2261,22 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     appendTrace(message) {
-        if (this.session?.tracing === false)
-            return;
+        // todo: improve tracing enablement
+        if (this.session?.tracing === false) return;
 
-            const log = this.shadowRoot.querySelector('.log');
-            if (!log) return;
+        const log = this.shadowRoot.querySelector('.log');
+        if (!log) return;
 
-            const max_entries = 1000;
-            const min_entries = 500;
+        const max_entries = 1000;
+        const min_entries = 500;
 
-            log.insertAdjacentHTML('beforeend', `${this.instanceId} ${message.replace("\n", "<br>")}<br>`);
-            if (log.childNodes.length > max_entries) {
-                while (log.childNodes.length > min_entries) {
-                    log.removeChild(log.firstChild);
-                }
+        log.insertAdjacentHTML('beforeend', `${this.instanceId} ${message.replace("\n", "<br>")}<br>`);
+        if (log.childNodes.length > max_entries) {
+            while (log.childNodes.length > min_entries) {
+                log.removeChild(log.firstChild);
             }
-            log.scrollTop = log.scrollHeight;
+        }
+        log.scrollTop = log.scrollHeight;
     }
 
     toggleFullScreen() {
@@ -2304,8 +2312,8 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     set hass(hass) {
-        if (!this.session) return;
-        this.session.hass = hass;
+        const session = this.session;
+        if (session) session.hass = hass;
     }
 
     handleVisibilityChange(visible, allow_background = undefined) {
@@ -2342,9 +2350,10 @@ class WebRTCbabycam extends HTMLElement {
                 }
             }
 
-            this.session.attachCard(this, this.handleSessionEvent);
+            const session = this.session;
+            session.attachCard(this, this.handleSessionEvent);
 
-            if (this.session?.background && this.config.muted !== true)
+            if (session.background && this.config.muted !== true)
                 this.unmuteMedia();
     
             this.loadRemoteStream();
@@ -2544,7 +2553,7 @@ class WebRTCbabycam extends HTMLElement {
         media.setAttribute('loaded', Date.now());
         media.srcObject = remoteStream;
 
-        if (play && this.session.isStreaming && !this.isPlaying) {
+        if (play && this.session?.isStreaming && !this.isPlaying) {
             this.playMedia();
         }
     }
@@ -2650,12 +2659,13 @@ class WebRTCbabycam extends HTMLElement {
         const media = this.media;
         if (!media) return;
 
-        const allowBackground = this.session?.background || this.config?.allow_background || this.config?.background;
+        const session = this.session;
+        const allowBackground = session?.background || this.config?.allow_background || this.config?.background;
         const allowMute = this.config?.allow_mute ?? true;
 
-        if (this.session?.background) {
+        if (session?.background) {
             this.trace("Exiting background mode");
-            this.session.background = false;
+            session.background = false;
 
             if (allowMute) {
                 this.trace("Muting media");
@@ -2672,9 +2682,9 @@ class WebRTCbabycam extends HTMLElement {
         }
     
         // no audio or unmuted
-        if (this.session && allowBackground) {
+        if (session && allowBackground) {
             this.trace("Enabling background mode");
-            this.session.background = true;
+            session.background = true;
             return;
         }
 
@@ -2694,7 +2704,8 @@ class WebRTCbabycam extends HTMLElement {
 
     playMedia(playMuted = undefined) {
 
-        if (this.session.isTerminated) return;
+        const session = this.session;
+        if (!session || session.isTerminated) return;
  
         const media = this.media;
 
@@ -2791,19 +2802,21 @@ class WebRTCbabycam extends HTMLElement {
  
     // General handler for media events
     handleMediaEvent(ev) {
+        
+        const session = this.session;
+        const media = this.media;
 
         this.trace(`Media ${ev.type}`);
         switch (ev.type) {
             case 'emptied':
                 this.live(false);
-                this.media.removeAttribute('playing');
+                media.removeAttribute('playing');
                 break;
 
             case 'pause':
                 this.live(false);
-                if (this.session.isTerminated) return;
+                if (!session || session.isTerminated) return;
 
-                const media = this.media;
                 media.setAttribute('playing', 'paused');
                 this.updateStatus();
                 this.updateVolume();
@@ -2847,11 +2860,11 @@ class WebRTCbabycam extends HTMLElement {
                 
                 this.playTimeoutId = setTimeout(() => {
                     
-                    if (!this.isPlaying || !this.session?.isStreaming)
-                        if (!this.session?.isAnyCardPlaying) {
+                    if (!this.isPlaying || !session?.isStreaming)
+                        if (!session?.isAnyCardPlaying) {
                             this.unloadRemoteStream();
                             this.trace('Play render timeout');
-                            this.session?.restart();
+                            session?.restart();
                         }
 
                 }, WebRTCsession.TIMEOUT_RENDERING);
@@ -2859,32 +2872,34 @@ class WebRTCbabycam extends HTMLElement {
                 break;
 
             case 'playing':
+                if (!session || session.isTerminated) return;
+
                 clearTimeout(this.playTimeoutId);
 
-                if (this.media.tagName === 'AUDIO') {
-                    this.media.setAttribute('playing', 'audio');
+                if (media.tagName === 'AUDIO') {
+                    media.setAttribute('playing', 'audio');
                     this.live(true);
                     this.updateStatus(); 
                     this.updateVolume();
                     return;
                 }
 
-                if (this.session.isStreamingAudio)
-                    this.media.setAttribute('playing', 'audiovideo');
+                if (session.isStreamingAudio)
+                    media.setAttribute('playing', 'audiovideo');
                 else
-                    this.media.setAttribute('playing', 'video');
+                    media.setAttribute('playing', 'video');
         
-                const w = this.media.videoWidth || 0;
-                const h = this.media.videoHeight || 0;
+                const w = media.videoWidth || 0;
+                const h = media.videoHeight || 0;
                 let aspectRatio = 0;
                 if (h > 0) {
                     aspectRatio = (w / h).toFixed(4);
                 }
-                this.media.setAttribute("aspect-ratio", aspectRatio);
-                this.media.style.setProperty(`--video-aspect-ratio`, `${aspectRatio}`);
+                media.setAttribute("aspect-ratio", aspectRatio);
+                media.style.setProperty(`--video-aspect-ratio`, `${aspectRatio}`);
         
-                if (!this.session.isStreamingAudio)
-                    this.media.classList.remove('unmute-pending');
+                if (!session.isStreamingAudio)
+                    media.classList.remove('unmute-pending');
         
                 this.live(true);
                 this.updateStatus(); 
@@ -2892,9 +2907,9 @@ class WebRTCbabycam extends HTMLElement {
                 break;
 
             case 'volumechange':
-                if (this.media.tagName === 'AUDIO') {
+                if (media.tagName === 'AUDIO') {
                     // Override default audio element behavior: mute controls play/pause
-                    if (this.media.muted)
+                    if (media.muted)
                         this.pauseMedia();
                     else
                         this.playMedia();
@@ -2916,15 +2931,14 @@ class WebRTCbabycam extends HTMLElement {
 
             case 'click':
                 WebRTCsession.enableUnmute();
-                if (this.media.controls) {
+                if (media.controls) {
                     this.setControlsVisibility(true);
                 }
                 break;
 
             case 'error':
-                this.lastError = this.media.error.message;
-                this.trace(`Media error ${this.media.error.code}; details: ${this.media.error.message}`);
-                //this.setStatus('error');
+                this.lastError = media.error.message;
+                this.trace(`Media error ${media.error.code}; details: ${media.error.message}`);
                 break;
 
             default:
