@@ -15,8 +15,15 @@ class WebRTCsession {
     static sessions = new Map();
     static unmuteEnabled = undefined;
 
-    static globalDebug = (new URLSearchParams(window.location.search)).has('debug');
-    static globalStats = (new URLSearchParams(window.location.search)).has('stats');
+    static globalDebug = (() => {
+        const value = (new URLSearchParams(window.location.search)).get('debug');
+        return value !== null ? value.toLowerCase() !== 'false' : undefined;
+    })();
+    
+    static globalStats = (() => {
+        const value = (new URLSearchParams(window.location.search)).get('stats');
+        return value !== null ? value.toLowerCase() !== 'false' : undefined;
+    })();
 
     // Timeout configurations in milliseconds
     static TIMEOUT_SIGNALING = 10000;
@@ -301,12 +308,6 @@ class WebRTCsession {
         return hasCardPlaying;
     }
 
-    get isAnyCardVisible() {
-        const hasCardVisible = [...this.state.cards].some(card => card.isVisibleInViewport === true);
-        return hasCardVisible;
-    }
- 
-
      /**
      * Retrieves the smallest 'interval' value from all attached cards.
      * If no intervals are defined, returns undefined.
@@ -482,6 +483,7 @@ class WebRTCsession {
             'imagechange',
             'trace',
             'debug',
+            'stats',
             'mute',
             'unmuteEnabled',
             'connected',
@@ -529,6 +531,7 @@ class WebRTCsession {
             'imagechange',
             'trace',
             'debug',
+            'stats',
             'mute',
             'unmuteEnabled',
             'connected',
@@ -596,6 +599,11 @@ class WebRTCsession {
     static toggleGlobalStats() {
         WebRTCsession.globalStats = !WebRTCsession.globalStats;
         console.debug(`Global stats mode ${WebRTCsession.globalStats ? 'enabled' : 'disabled'}`); 
+
+        const iterator = WebRTCsession.sessions.values();
+        for (const session of iterator) {
+            session.eventTarget.dispatchEvent(new CustomEvent('stats', { detail: { stats: WebRTCsession.globalStats } }));
+        }
     }
 
     get status() {
@@ -1629,51 +1637,33 @@ class WebRTCbabycam extends HTMLElement {
         card.insertAdjacentElement('beforebegin', style);
     }
 
-    syncLoadingAnimation() {
-        const now = performance.now();
-
-        // Select all elements with the `icon="mdi:loading"` attribute
-        const loadingElements = document.querySelectorAll('.state[icon="mdi:loading"]');
-    
-        // Synchronize animations
-        loadingElements.forEach(el => {
-          const delay = -(now % 1000) / 1000; // Calculate delay relative to the current time
-          el.style.animationDelay = `${delay}s`; // Apply the negative delay
-        });
-      }
-
     static globalInit() {
         if (WebRTCbabycam.initialStaticSetupComplete)
             return;
 
         const handleKeyUp = (ev) => {
-            //WebRTCsession.enableUnmute();
             const unmute = "KeyT";
             const debug = "KeyD";
-            const shiftA = "ShiftRight";
-            const shiftB = "ShiftLeft";
-            const shiftC = "ShiftKey";
-                switch (ev.code) {
-                    case unmute:
-                        WebRTCsession.toggleGlobalMute();
-                        break;
-                    case debug:
-                        WebRTCsession.toggleGlobalDebug();
-                        break;
-                    case shiftA:
-                    case shiftB:
-                    case shiftC:
-                        // if (session.state.activeCard?.config?.debug) {
-                        //     const log = session.state.activeCard.shadowRoot.querySelector('.log');
-                        //     if (log) log.classList.remove('pointerevents');
-                        // }
-                        break;
-                }
-        };
+            const stats = "KeyS";
 
+            if (!ev.shiftKey) return;
+
+            switch (ev.code) {
+                case unmute:
+                    WebRTCsession.toggleGlobalMute();
+                    break;
+                case debug:
+                    WebRTCsession.toggleGlobalDebug();
+                    break;
+                case stats:
+                    WebRTCsession.toggleGlobalStats();
+                    break;
+            }
+        };
+        document.addEventListener('keyup', handleKeyUp, true);
+        
         document.addEventListener('mousedown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
         document.addEventListener('keydown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
-        document.addEventListener('keyup', handleKeyUp, true);
         
         WebRTCbabycam.initialStaticSetupComplete = true;
     }
@@ -1766,6 +1756,8 @@ class WebRTCbabycam extends HTMLElement {
             case 'trace':
                 this.appendTrace(ev.detail.message);
                 break;
+            case 'stats':
+                break;         
             case 'debug':
                 this.setDebugVisibility(ev.detail.debug);
                 break;
@@ -2037,7 +2029,7 @@ class WebRTCbabycam extends HTMLElement {
     }
  
     get isPaused() {
-        
+
         const media = this.media;
         const paused = media && media.getAttribute('playing') === 'paused';
         return paused;
@@ -2096,7 +2088,9 @@ class WebRTCbabycam extends HTMLElement {
 
         if (playing) {
             this.waitStartDate = null;
-            if (this.config.stats || WebRTCsession.globalStats) {
+
+            const showStats = WebRTCsession.globalStats || (this.config.stats && WebRTCsession.globalStats !== false);
+            if (showStats) {
                 this.header = this.session?.state?.statistics ?? "";
             }
             else {
@@ -2522,7 +2516,7 @@ class WebRTCbabycam extends HTMLElement {
         setTimeout(() => {
             this.setControlsVisibility(false);
             this.setPTZVisibility(false);
-            this.setDebugVisibility(WebRTCsession.globalDebug || this.config.debug);
+            this.setDebugVisibility(WebRTCsession.globalDebug || (this.config.debug && WebRTCsession.globalDebug !== false));
         });
     }
 
