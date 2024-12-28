@@ -380,9 +380,12 @@ class WebRTCsession {
                     // todo: better detect interrupted audio
 
                     this.extendConnectionTimeout(WebRTCsession.TIMEOUT_RENDERING);
-                    this.eventTarget.dispatchEvent(new CustomEvent('heartbeat', { detail: {} }));
+                    this.eventTarget.dispatchEvent(new CustomEvent('heartbeat', { detail: {live: true} }));
                     // todo: if (this.config.stats)
                     await this.getStats(this.state.call);
+                }
+                else {
+                    this.eventTarget.dispatchEvent(new CustomEvent('heartbeat', { detail: {live: false} }));
                 }
             }
             else {
@@ -497,8 +500,6 @@ class WebRTCsession {
             return;
         }
         
-        //todo: WebRTCsession.enablePinchZoom();
-
         if (card.isVisibleInViewport || this.background) {
             setTimeout(() => {
                 this.play();
@@ -540,7 +541,7 @@ class WebRTCsession {
         this.state.cards.delete(card);
         const remaining = this.state.cards.size;
         if (remaining > 0) {
-            this.trace(`Detached ${remaining} cards remaining in this session`);
+            this.trace(`Detached ${card.instanceId}, cards remaining in this session: ${remaining}`);
             return;
         }
 
@@ -596,41 +597,6 @@ class WebRTCsession {
         WebRTCsession.globalStats = !WebRTCsession.globalStats;
         console.debug(`Global stats mode ${WebRTCsession.globalStats ? 'enabled' : 'disabled'}`); 
     }
-
-    // static enablePinchZoom() {
-    //     let viewport = document.querySelector("meta[name=viewport]");
-    //     if (!viewport) {
-    //         viewport = document.createElement("meta");
-    //         viewport.setAttribute("name", "viewport");
-    //         viewport.setAttribute("content", "width=device-width, viewport-fit=cover");
-    //         document.head.appendChild(viewport);
-    //     }
-
-    //     if (!WebRTCsession.defaultViewportContent) {
-    //         const mediaQueryList = window.matchMedia("(orientation: portrait)");
-    //         mediaQueryList.addEventListener('change', () => WebRTCsession.resetPinchZoomScale());
-    //         WebRTCsession.defaultViewportContent = viewport.getAttribute('content');
-    //     }
-
-    //     WebRTCsession.resetPinchZoomScale();
-    //     viewport.setAttribute('content', "initial-scale=1.0, minimum-scale=1.0, maximum-scale=5.0");
-    // }
-
-    // static resetPinchZoomScale() {
-    //     const viewport = document.querySelector("meta[name=viewport]");
-    //     if (!viewport) return;
-    //     const content = viewport.getAttribute('content');
-    //     viewport.setAttribute('content', "initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0");
-    //     viewport.setAttribute('content', content);
-    // }
-
-    // static restorePinchZoomDefaults() {
-    //     WebRTCsession.resetPinchZoomScale();
-    //     const viewport = document.querySelector("meta[name=viewport]");
-    //     if (viewport && WebRTCsession.defaultViewportContent) {
-    //         viewport.setAttribute("content", WebRTCsession.defaultViewportContent);
-    //     }
-    // }
 
     get status() {
         return this.state.status;
@@ -1787,7 +1753,7 @@ class WebRTCbabycam extends HTMLElement {
                 this.updateVolume();
                 break;
             case 'heartbeat':
-                this.alive(true);
+                this.live(ev.detail.live);
                 this.updateStatus();
                 this.updateVolume();
                 break;
@@ -2024,25 +1990,21 @@ class WebRTCbabycam extends HTMLElement {
         }
     }
 
-    setIcon(newIcon, visible = undefined, errorMessage = undefined) {
+    setStateIcon(icon, show = undefined, title = undefined) {
         const stateIcon = this.shadowRoot.querySelector('.state');
         if (!stateIcon) return;
 
-        if (errorMessage) {
-            stateIcon.setAttribute("error", "");
-            stateIcon.title = errorMessage;
-        }
-        else {
-            stateIcon.removeAttribute("error");
-            stateIcon.title = "";
+        if (title !== undefined) {
+            stateIcon.title = title;
+            show = true;
         }
 
         const currentIcon = stateIcon.getAttribute('icon');
-        if (newIcon != currentIcon) {
-            stateIcon.icon = newIcon;
-            stateIcon.setAttribute('icon', newIcon);
+        if (icon !== undefined && icon != currentIcon) {
+            stateIcon.icon = icon;
+            stateIcon.setAttribute('icon', icon);
 
-            if (newIcon === 'mdi:loading') {
+            if (icon === 'mdi:loading') {
                 // Synchronize the spin animation based on current time
                 const now = Date.now();
                 const elapsed = now % 1000; 
@@ -2057,14 +2019,14 @@ class WebRTCbabycam extends HTMLElement {
             }
         }
 
-        if (visible || stateIcon.hasAttribute("error"))
+        if (show === true)
             stateIcon.classList.add('show');
-        else
+        else if (show === false)
             stateIcon.classList.remove('show');
     }
 
     get isPlaying() {
-        
+
         const media = this.media;
         const session = this.session;
         if (!media || !session?.isStreaming)
@@ -2072,10 +2034,10 @@ class WebRTCbabycam extends HTMLElement {
 
         const playing = (media.getAttribute('playing') === 'video' || media.getAttribute('playing') === 'audiovideo' || media.getAttribute('playing') === 'audio');
         return playing;
-        
     }
  
     get isPaused() {
+        
         const media = this.media;
         const paused = media && media.getAttribute('playing') === 'paused';
         return paused;
@@ -2083,49 +2045,47 @@ class WebRTCbabycam extends HTMLElement {
 
     updateStatus() {
 
-        if (!this.session || !this.session.status) {
-            this.setIcon("mdi:heart-broken", false, null);
-            this.updateImage(null);
-            return;
-        }
-        if (this.session.isTerminated === true) {
-            this.setIcon("mdi:emoticon-dead", false, null);
-            this.updateImage(null);
-            return;
-        }
         if (this.config?.video === false && this.config?.audio === false) {
             // pure image mode => no streaming icon
             return;
         }
-
-        const status = this.session.status;
+        const status = this.session?.status;
         const media = this.media;
         const playing = this.isPlaying;
         const doesntplay = this.config.video === false && this.config.audio === false;
         const paused = this.isPaused;
+        const error = this.session?.lastError;
 
         const waitedTooLong = WebRTCsession.TIMEOUT_RENDERING;
         let iconToShow = null;
 
         switch (status) {
-            case "reset":
+            case null:
                 this.waitStartDate = Date.now();
-                this.setIcon(null, false);
+                this.setStateIcon("mdi:heart-broken", true);
+                this.updateImage(null);
+                return;  
+
+            case 'terminated':
+                this.waitStartDate = Date.now();
+                this.setStateIcon("mdi:emoticon-dead", true);
+                this.updateImage(null);
+                return;  
+
+            case 'reset':
+                this.waitStartDate = Date.now();
+                this.setStateIcon(null, false);
                 return;
 
-            case "terminated":
-                this.setIcon("mdi:emoticon-dead", false, null);
-                return;
+            case 'error':
+                this.setStateIcon("mdi:alert-circle", true, error);
 
-            case "error":
-                this.setIcon("mdi:alert-circle", true, this.session.lastError);
-                return;
-
-            case "disconnected":
+            case 'disconnected':
                 if (!this.waitStartDate)
                     this.waitStartDate = Date.now();
-                // fall through
-            case "connecting":
+                // fall through to connecting
+
+            case 'connecting':
                 iconToShow = (media?.tagName === 'AUDIO') ? "mdi:volume-mute" : "mdi:loading";
                 setTimeout(() => this.updateStatus(), waitedTooLong);
                 break;
@@ -2142,7 +2102,7 @@ class WebRTCbabycam extends HTMLElement {
             else {
                 this.header = "";
             }
-            this.setIcon(null, false);
+            this.setStateIcon(null, false);
             iconToShow = (media?.tagName === 'AUDIO') ? "mdi:volume-high" : "mdi:play";
         }
         else if (paused) {
@@ -2152,33 +2112,36 @@ class WebRTCbabycam extends HTMLElement {
         if (this.session.isStreaming) {
             if (media?.tagName == 'AUDIO') {
                 if (this.session.background) 
-                    this.setIcon("mdi:pin", true);
+                    this.setStateIcon("mdi:pin", true);
                 else if (media.muted && this.config.muted === false) 
-                    this.setIcon(iconToShow, true);
+                    this.setStateIcon(iconToShow, true);
                 else 
-                    this.setIcon(iconToShow, false);
+                    this.setStateIcon(iconToShow, false);
             }
             else {
-                switch (media?.getAttribute('playing')) {
+                switch (media.getAttribute('playing')) {
                     case 'paused':
-                        this.setIcon(iconToShow, true);
+                        this.setStateIcon(iconToShow, true);
                         break;
+
                     case 'video':
                         if (this.session.background) 
-                            this.setIcon("mdi:pin", true);
+                            this.setStateIcon("mdi:pin", true);
                         else
-                            this.setIcon(iconToShow, false);
+                            this.setStateIcon(iconToShow, false);
                         break;
+
                     case 'audiovideo':
                         if (media.muted && this.config.muted === false) 
-                            this.setIcon("mdi:volume-mute", true);
+                            this.setStateIcon("mdi:volume-mute", true);
                         else if (this.session.background) 
-                            this.setIcon("mdi:pin", true);
+                            this.setStateIcon("mdi:pin", true);
                         else if (!media.muted && this.config.muted === true) 
-                                this.setIcon("mdi:volume-high", true);
+                                this.setStateIcon("mdi:volume-high", true);
                         else 
-                            this.setIcon(iconToShow, false);
+                            this.setStateIcon(iconToShow, false);
                         break;
+
                     default:
                         break;
                 }
@@ -2187,9 +2150,9 @@ class WebRTCbabycam extends HTMLElement {
         else {
             // not streaming or not yet started 
             if (this.waitStartDate && (Date.now() >= this.waitStartDate + waitedTooLong)) {
-                this.setIcon(iconToShow, true);
+                this.setStateIcon(iconToShow, true);
             } else {
-                this.setIcon(iconToShow, false);
+                this.setStateIcon(iconToShow, false);
             }
         }
     }
@@ -2602,7 +2565,7 @@ class WebRTCbabycam extends HTMLElement {
         }
     }
 
-    alive(on) {
+    live(on) {
 
         const container = this.shadowRoot?.querySelector(".media-container");
         if (!container) return;
@@ -2838,12 +2801,12 @@ class WebRTCbabycam extends HTMLElement {
         this.trace(`Media ${ev.type}`);
         switch (ev.type) {
             case 'emptied':
-                this.alive(false);
+                this.live(false);
                 this.media.removeAttribute('playing');
                 break;
 
             case 'pause':
-                this.alive(false);
+                this.live(false);
                 if (this.session.isTerminated) return;
 
                 const media = this.media;
@@ -2902,12 +2865,11 @@ class WebRTCbabycam extends HTMLElement {
                 break;
 
             case 'playing':
-
                 clearTimeout(this.playTimeoutId);
 
                 if (this.media.tagName === 'AUDIO') {
                     this.media.setAttribute('playing', 'audio');
-                    this.alive(true);
+                    this.live(true);
                     this.updateStatus(); 
                     this.updateVolume();
                     return;
@@ -2930,7 +2892,7 @@ class WebRTCbabycam extends HTMLElement {
                 if (!this.session.isStreamingAudio)
                     this.media.classList.remove('unmute-pending');
         
-                this.alive(true);
+                this.live(true);
                 this.updateStatus(); 
                 this.updateVolume();
                 break;
@@ -3192,9 +3154,11 @@ class Go2RtcSignalingChannel extends SignalingChannel {
         this.handleError = this.handleError.bind(this);
         this.handleClose = this.handleClose.bind(this);
     }
+
     get isOpen() {
         return this.ws != null && this.ws.readyState === WebSocket.OPEN;
     }
+
     async open(timeout) {
         return new Promise((resolve, reject) => {
             if (this.ws) {
@@ -3208,19 +3172,23 @@ class Go2RtcSignalingChannel extends SignalingChannel {
             ws.addEventListener('error', this.handleError);
             ws.addEventListener('close', this.handleClose);
             this.ws = ws;
+
             this.websocketTimeoutId = setTimeout(() => {
                 if (ws.readyState !== WebSocket.OPEN && ws.readyState !== WebSocket.CLOSING) {
                     ws.close();
+                    const timeoutError = new Error(`WebSocket connection timed out after ${timeout}ms`);
                     if (this.onerror) {
-                        this.onerror(new Error(`WebSocket connection timed out after ${timeout}ms`));
+                        this.onerror(timeoutError);
                     }
-                    reject(new Error(`WebSocket connection timed out after ${timeout}ms`));
+                    reject(timeoutError);
                 }
             }, timeout);
+
             this._resolveOpen = resolve;
             this._rejectOpen = reject;
         });
     }
+
     close() {
         const ws = this.ws;
         if (ws) {
@@ -3228,10 +3196,11 @@ class Go2RtcSignalingChannel extends SignalingChannel {
                 clearTimeout(this.websocketTimeoutId);
                 this.websocketTimeoutId = undefined;
             }
-            this.trace(`Closing websocket in ${ws.readyState} state`);
+            this.trace(`Closing WebSocket in state: ${ws.readyState} (${this.getReadyStateText(ws.readyState)})`);
             if ([WebSocket.CONNECTING, WebSocket.OPEN].includes(ws.readyState)) {
                 ws.close();
             }
+
             ws.removeEventListener('message', this.handleMessage);
             ws.removeEventListener('open', this.handleOpen);
             ws.removeEventListener('error', this.handleError);
@@ -3239,29 +3208,57 @@ class Go2RtcSignalingChannel extends SignalingChannel {
             this.ws = null;
         }
     }
+
     async sendCandidate(rtcIceCandidate) {
-        if (!this.isOpen) throw new Error(`Cannot send candidate from closed WebSocket`);
+        if (!this.isOpen) {
+            const errorMsg = `Cannot send candidate because WebSocket is not open. Current readyState: ${this.ws ? this.ws.readyState : 'NO_WEBSOCKET'}`;
+            throw new Error(errorMsg);
+        }
         const message = {
             type: "webrtc/candidate",
             value: rtcIceCandidate ? rtcIceCandidate.candidate : ""
         };
-        this.ws.send(JSON.stringify(message));
+        try {
+            this.ws.send(JSON.stringify(message));
+        } catch (error) {
+            const sendError = `Failed to send candidate: ${error.message}`; 
+            if (this.onerror) {
+                this.onerror(new Error(sendError));
+            }
+            throw error;
+        }
     }
+
     async sendOffer(rtcSessionDescription) {
-        if (!this.isOpen) throw new Error(`Cannot send offer from closed WebSocket`);
+        if (!this.isOpen) {
+            const errorMsg = `Cannot send offer because WebSocket is not open. Current readyState: ${this.ws ? this.ws.readyState : 'NO_WEBSOCKET'}`;
+            throw new Error(errorMsg);
+        }
         const message = {
             type: 'webrtc/offer',
             value: rtcSessionDescription.sdp
         };
-        this.ws.send(JSON.stringify(message));
+        try {
+            this.ws.send(JSON.stringify(message));
+        } catch (error) {
+            const sendError = `Failed to send offer: ${error.message}`; 
+            if (this.onerror) {
+                this.onerror(new Error(sendError));
+            }
+            throw error;
+        }
     }
+
     handleMessage(ev) {
         if (typeof ev.data === "string") {
             let msg;
             try {
                 msg = JSON.parse(ev.data);
             } catch (error) {
-                console.error("Failed to parse message:", ev.data);
+                const parseError = `Failed to parse incoming message as JSON: ${ev.data}`;
+                if (this.onerror) {
+                    this.onerror(new Error(parseError));
+                }
                 return;
             }
             switch (msg.type) {
@@ -3278,17 +3275,22 @@ class Go2RtcSignalingChannel extends SignalingChannel {
                     break;
                 case "error":
                     if (msg.value && this.onerror) {
-                        this.onerror({ message: msg.value });
+                        this.onerror(new Error(`Server error: ${msg.value}`));
                     }
                     this.close();
                     break;
                 default:
+                    console.warn(`Unhandled message type: ${msg.type}`);
                     break;
             }
         } else {
-            console.warn("Received binary data which is not handled:", ev.data);
+            const warning = `Received binary data which is not handled: ${ev.data}`;
+            if (this.onerror) {
+                this.onerror(new Error(warning));
+            }
         }
     }
+
     handleOpen() {
         if (this.websocketTimeoutId) {
             clearTimeout(this.websocketTimeoutId);
@@ -3299,35 +3301,62 @@ class Go2RtcSignalingChannel extends SignalingChannel {
             this._resolveOpen = null;
             this._rejectOpen = null;
         }
-        this.trace(`WebSocket signaling channel opened`);
+        this.trace(`WebSocket signaling channel opened. URL: ${this.url}`);
     }
-    handleError() {
+
+    handleError(ev) {
         if (this.websocketTimeoutId) {
             clearTimeout(this.websocketTimeoutId);
             this.websocketTimeoutId = undefined;
         }
+
+        const errorMessage = `WebSocket encountered an error. Current readyState: ${this.ws.readyState} (${this.getReadyStateText(this.ws.readyState)})`;
+
         if (this._rejectOpen) {
-            this._rejectOpen(new Error("WebSocket encountered an error"));
+            this._rejectOpen(new Error(errorMessage));
             this._resolveOpen = null;
             this._rejectOpen = null;
         }
-        if (this.onerror) {
-            this.onerror(new Error("WebSocket encountered an error"));
-        }
+
+        // safari throws error when the server closes unexpectedly 
+        // if (this.onerror) {
+        //     this.onerror(new Error(errorMessage));
+        // }
+
         this.close();
     }
-    handleClose() {
-        this.trace(`WebSocket signaling channel closed`);
+
+    handleClose(event) {
+        const message = `WebSocket signaling channel closed. Code: ${event.code}, Reason: ${event.reason}, Was Clean: ${event.wasClean}`;
+        this.trace(message);
+        console.warn(message);
+
         this.ws = null;
         if (this._rejectOpen) {
-            this._rejectOpen(new Error("WebSocket connection was closed before opening"));
+            this._rejectOpen(new Error(`WebSocket connection was closed before opening. Code: ${event.code}, Reason: ${event.reason}`));
             this._resolveOpen = null;
             this._rejectOpen = null;
         }
     }
+
     trace(message) {
         if (this.ontrace)
             this.ontrace(message);
+    }
+
+    getReadyStateText(state) {
+        switch(state) {
+            case WebSocket.CONNECTING:
+                return 'CONNECTING';
+            case WebSocket.OPEN:
+                return 'OPEN';
+            case WebSocket.CLOSING:
+                return 'CLOSING';
+            case WebSocket.CLOSED:
+                return 'CLOSED';
+            default:
+                return 'UNKNOWN';
+        }
     }
 }
 
