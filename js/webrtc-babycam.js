@@ -225,8 +225,7 @@ class WebRTCsession {
 
     async updateStatistics() {
 
-        try
-        {
+        try {
             let prev = null;
             if (this.statsHistory.length > 0) {
                 prev = this.statsHistory[this.statsHistory.length - 1];
@@ -374,8 +373,7 @@ class WebRTCsession {
                 // WebRTC disabled by configuration
             }           
             else if (!call || call.reconnectDate === 0) {
-                // Initialize connection
-                call = this.startCall();
+                call = await this.startCall();
             }
             else if (now < call.reconnectDate) {
                 // Connecting or previously connected, extend reconnection if streaming:
@@ -393,10 +391,9 @@ class WebRTCsession {
                 }
             }
             else {
-                // Timeout; restart call
-                //this.timeoutCall(call);
-                this.endCall(call);
                 this.trace(`Play watchdog timeout`);
+                await this.endCall(call);
+                call = null;
             }
 
             // todo: if (this.config.stats)
@@ -408,7 +405,6 @@ class WebRTCsession {
             this.trace(`Play ${err.name}: ${err.message}`);
         }
         finally {
-        
             const now = Date.now();
             const nextSecond = Math.ceil(now / 1000) * 1000;
             const intervalRemaining = nextSecond - now;
@@ -707,8 +703,8 @@ class WebRTCsession {
             return;
         }
         
-        for (const [id, call] of new Map(this.state.calls)) {
-            await this.endCall(call);  
+        for (const call of this.state.calls.values()) {
+            await this.endCall(call);
         }
 
         const now = Date.now();
@@ -750,6 +746,10 @@ class WebRTCsession {
             }
 
             await this.openSignalingChannel(call, this.config.url_type);
+            if (!call.signalingChannel) {
+                throw new Error('Signaling channel is not available.');
+            }
+
             this.createPeerConnection(call);
 
             if (this.config.video !== false) {
@@ -778,32 +778,43 @@ class WebRTCsession {
                 call.peerConnection.addTransceiver('audio', { direction: 'recvonly' });
                 this.trace('Configured audio transceiver: receive-only.');
             }
-
-            const offer = await call.peerConnection.createOffer({
-                voiceActivityDetection: false,
-                iceRestart: true
-            });
-            this.trace('Offer created.');
-    
-            await call.peerConnection.setLocalDescription(offer);
-            this.trace('Local description set successfully.');
-    
-            if (call.signalingChannel) {
-                this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
-                await call.signalingChannel.sendOffer(offer);
-                this.trace('Offer sent via signaling channel.');
-            } 
-            else {
-                throw new Error('Signaling channel is not available.');
-            }
         } catch (err) {
             this.lastError = `Error establishing WebRTC call. ${err.name}: ${err.message}`;
             this.trace(this.lastError);
             this.setStatus('error');
 
-            //this.extendCallTimeout(WebRTCsession.TIMEOUT_ERROR);
             await this.endCall(call);
+            return null;
         }
+
+        (async () => {
+            try {
+                const offer = await call.peerConnection.createOffer({
+                    voiceActivityDetection: false,
+                    iceRestart: true
+                });
+                this.trace('Offer created.');
+        
+                await call.peerConnection.setLocalDescription(offer);
+                this.trace('Local description set successfully.');
+        
+                if (call.signalingChannel) {
+                    this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
+                    await call.signalingChannel.sendOffer(offer);
+                    this.trace('Offer sent via signaling channel.');
+                } 
+                else {
+                    throw new Error('Signaling channel is not available.');
+                }
+            } catch (err) {
+                this.lastError = `Error negotiating WebRTC call. ${err.name}: ${err.message}`;
+                this.trace(this.lastError);
+                this.setStatus('error');
+
+                await this.endCall(call);
+            }
+        })();
+
         return call;
     }
     
@@ -2970,12 +2981,12 @@ class WebRTCbabycam extends HTMLElement {
                 break;
 
             case 'volumechange':
-                if (!media.muted && media.classList.contains('unmute-pending')) {
-                    // todo: test do we need to check for playing?
-                    debugger;
-                    media.classList.remove('unmute-pending');
-                    WebRTCsession.enableUnmute();
-                }
+
+                // todo: consider volumechange enableUnmute implementation
+                // if (media is playing && !media.muted && media.classList.contains('unmute-pending')) {
+                //     media.classList.remove('unmute-pending');
+                //     WebRTCsession.enableUnmute();
+                // }
                 
                 if (media.tagName === 'AUDIO') {
                     // Override default audio element behavior: mute controls play/pause
