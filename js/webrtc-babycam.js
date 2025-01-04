@@ -406,8 +406,7 @@ class WebRTCsession {
         }
         finally {
             const now = Date.now();
-            const nextSecond = Math.ceil(now / 1000) * 1000;
-            const intervalRemaining = nextSecond - now;
+            const intervalRemaining = 1000 - (now % 1000);
             const timeoutRemaining = call ? call.reconnectDate - now : intervalRemaining;
             const loopDelay = Math.max(0, Math.min(intervalRemaining, timeoutRemaining));
 
@@ -455,8 +454,8 @@ class WebRTCsession {
         this.fetchImageTimeoutId = undefined;
         this.terminationTimeoutId = undefined;
 
-        for (const [id, call] of new Map(this.state.calls)) {
-            await this.endCall(call);  
+        for (const call of [...this.state.calls.values()]) {
+            await this.endCall(call);
         }
     }
 
@@ -703,7 +702,7 @@ class WebRTCsession {
             return;
         }
         
-        for (const call of this.state.calls.values()) {
+        for (const call of [...this.state.calls.values()]) {
             await this.endCall(call);
         }
 
