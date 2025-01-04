@@ -6,13 +6,13 @@ console.info(
 );
 
 const noop = () => {};
+window.webrtcSessions = window.webrtcSessions ?? new Map();
 
 /**
  * WebRTC Babycam Custom Element
  * Provides a lag-free 2-way audio, video, and image camera card.
  */
 class WebRTCsession {
-    static sessions = new Map();
     static unmuteEnabled = undefined;
 
     static globalDebug = (() => {
@@ -45,13 +45,10 @@ class WebRTCsession {
 
         this.state = {
             cards: new Set(),
-            activeCard: null,
-            call: null,
             image: null,
-            reconnectDate: 0,
             statistics: "",
-            status: 'uninitialized' 
-            
+            status: 'uninitialized',
+            calls: new Map()
         };
 
         this.lastError = null;
@@ -71,6 +68,10 @@ class WebRTCsession {
             this.microphone = true;
 
         this.determineUnmuteEnabled();
+    }
+
+    static get sessions() { 
+        return window.webrtcSessions;
     }
 
     static key(config) {
@@ -300,6 +301,11 @@ class WebRTCsession {
         }
     }
 
+    getActiveCall() {
+        if (this.state.calls.size === 0) return null;
+        return [...this.state.calls.values()].pop();
+    }
+
     get isAnyCardPlaying() {
         if (!this.isStreaming)
             return false;
@@ -323,7 +329,7 @@ class WebRTCsession {
         }
 
         const interval = Math.min(...intervals);
-        return interval;
+        return Math.max(10, interval);
     }
     
     imageLoop() {
@@ -348,9 +354,11 @@ class WebRTCsession {
     }
 
     async play(id = undefined) {
-        if (id != this.watchdogTimeoutId) {
+        if (id !== this.watchdogTimeoutId) {
             return;
         }
+
+        let call = this.getActiveCall();
 
         try {
             if (!id) {
@@ -363,107 +371,107 @@ class WebRTCsession {
             const now = Date.now();
 
             if (this.config.video === false && this.config.audio === false) {
-                // WebRTC disabled
-                this.extendConnectionTimeout(1000);
+                // WebRTC disabled by configuration
+            }           
+            else if (!call || call.reconnectDate === 0) {
+                // Initialize connection
+                call = this.startCall();
             }
-            else if (this.state.reconnectDate === 0) {
-
-                // initialize connection
-                await this.endCall(this.state.call);
-                this.extendConnectionTimeout(WebRTCsession.TIMEOUT_SIGNALING);
-                this.startCall();
-            }
-            else if (now < this.state.reconnectDate) {
+            else if (now < call.reconnectDate) {
                 // Connecting or previously connected, extend reconnection if streaming:
-                
                 if (this.isStreaming && (this.config.video === false || this.isAnyCardPlaying)) {
 
                     // todo: better detect interrupted audio
 
-                    this.extendConnectionTimeout(WebRTCsession.TIMEOUT_RENDERING);
+                    this.extendCallTimeout(call, WebRTCsession.TIMEOUT_RENDERING);
                     this.eventTarget.dispatchEvent(new CustomEvent('heartbeat', { detail: {live: true} }));
                     // todo: if (this.config.stats)
-                    await this.getStats(this.state.call);
+                    await this.getStats(call);
                 }
                 else {
                     this.eventTarget.dispatchEvent(new CustomEvent('heartbeat', { detail: {live: false} }));
                 }
             }
             else {
-                // We haven't connected; restart call
-                if (this.state.call) {
-                    this.state.reconnectDate = 0
-                    this.trace(`Play watchdog timeout`);
-                }
+                // Timeout; restart call
+                //this.timeoutCall(call);
+                this.endCall(call);
+                this.trace(`Play watchdog timeout`);
             }
 
             // todo: if (this.config.stats)
             await this.updateStatistics();
-            
+
         }
         catch (err) {
             this.lastError = err.message;
             this.trace(`Play ${err.name}: ${err.message}`);
         }
         finally {
-            
-            const now = Date.now(); 
-            const interval = 1000 - (now % 1000);  
-            const connectionTimeout = this.state.reconnectDate - now;
-            const delay = Math.max(10, Math.min(connectionTimeout, interval));
+        
+            const now = Date.now();
+            const nextSecond = Math.ceil(now / 1000) * 1000;
+            const intervalRemaining = nextSecond - now;
+            const timeoutRemaining = call ? call.reconnectDate - now : intervalRemaining;
+            const loopDelay = Math.max(0, Math.min(intervalRemaining, timeoutRemaining));
 
             clearTimeout(this.watchdogTimeoutId);
-            const loop = setTimeout(() => this.play(loop), delay);
-            this.watchdogTimeoutId = loop;
+            const loopId = setTimeout(() => this.play(loopId), loopDelay);
+            this.watchdogTimeoutId = loopId;
         }
     }
 
-    set tracing(enabled) {
-        if (enabled)
-            this.trace = this._trace.bind(this);
-        else
-            this.trace = noop;
+    extendCallTimeout(call, ms = 0) {
+        if (!call) return;
+        call.reconnectDate = Math.max(Date.now() + ms, call.reconnectDate);
     }
 
-    get tracing() {
-        return this.trace !== noop;
+    timeoutCall(call) { 
+        if (!call) return;
+        call.reconnectDate = 0;
     }
 
-    _trace(message, o) {
-        const call = this.state?.call;
-        const callStarted = call?.startDate;
-        const now = Date.now();
-        
-        const timestamp = callStarted ? (now - callStarted) : (new Date).getTime();
-        const id = call?.id ?? this.key;
-        const text = `${id}:${timestamp}: ${message}`;
-        if (o)
-            console.debug(text, o);
-        else
-            console.debug(text);
+    async restartCall(call) {
+        call = call ?? this.getActiveCall();
+        if (!call) return;
 
-        this.eventTarget.dispatchEvent(new CustomEvent('trace', { detail: { message: text } }));
-    }
+        this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
 
-    extendConnectionTimeout(ms = 0) {
-        this.state.reconnectDate = Math.max(Date.now() + ms, this.state.reconnectDate);
-    }
-
-
-    async restart(call) {
         this.trace('Restarting call');
         await this.endCall(call);
 
         clearTimeout(this.watchdogTimeoutId);
         this.watchdogTimeoutId = undefined;
-        this.state.reconnectDate = 0;
+        this.timeoutCall(call);
         this.play();
     }
 
+    async terminate() {
+        this.setStatus('terminated');
+        
+        clearTimeout(this.watchdogTimeoutId);
+        clearTimeout(this.imageLoopTimeoutId);
+        clearTimeout(this.fetchImageTimeoutId);
+        clearTimeout(this.terminationTimeoutId);
+        
+        this.watchdogTimeoutId = undefined;
+        this.imageLoopTimeoutId = undefined;
+        this.fetchImageTimeoutId = undefined;
+        this.terminationTimeoutId = undefined;
+
+        for (const [id, call] of new Map(this.state.calls)) {
+            await this.endCall(call);  
+        }
+    }
 
     attachCard(card, messageHandler) {
 
         this.trace(`Attaching new card ${card.instanceId} to session`);
+
+        if (this.background) {
+            card.releaseOtherBackgroundCards();
+        }
+
         if (this.terminationTimeoutId) {
             clearTimeout(this.terminationTimeoutId);
             this.terminationTimeoutId = null;
@@ -475,12 +483,12 @@ class WebRTCsession {
         this.state.cards.add(card);
 
         const sessionEventTypes = [
-            'statuschange',
+            'status',
             'remotestream',
-            'backgroundchange',
+            'background',
             'heartbeat',
-            'microphonechange',
-            'imagechange',
+            'microphone',
+            'image',
             'trace',
             'debug',
             'stats',
@@ -517,18 +525,13 @@ class WebRTCsession {
             return;
         }
 
-        if (this.background) {
-            this.trace("detachCard: Session sent to background");
-            return;
-        }
-
         const sessionEventTypes = [
-            'statuschange',
+            'status',
             'remotestream',
-            'backgroundchange',
+            'background',
             'heartbeat',
-            'microphonechange',
-            'imagechange',
+            'microphone',
+            'image',
             'trace',
             'debug',
             'stats',
@@ -563,15 +566,14 @@ class WebRTCsession {
     /**
      * Invoked whenever the browser is expected to allow unmuted audio play 
      */
-    static enableUnmute() {
-        if (WebRTCsession.unmuteEnabled)
-            return;
-        else
-            WebRTCsession.unmuteEnabled = true;
+    static enableUnmute(value = true) {
+        if (WebRTCsession.unmuteEnabled === value) return;
+            
+        WebRTCsession.unmuteEnabled = value;
 
         const iterator = WebRTCsession.sessions.values();
         for (const session of iterator) {
-            session.eventTarget.dispatchEvent(new CustomEvent('unmuteEnabled', { detail: { unmuteEnabled: true } }));
+            session.eventTarget.dispatchEvent(new CustomEvent('unmuteEnabled', { detail: { unmuteEnabled: value } }));
         }
     }
         
@@ -606,42 +608,51 @@ class WebRTCsession {
         }
     }
 
-    get status() {
-        return this.state.status;
+    _trace(message, o) {
+        const call = this.getActiveCall();
+        const callStarted = call?.startDate;
+        const now = Date.now();
+        
+        const timestamp = callStarted ? (now - callStarted) : (new Date).getTime();
+        const id = call?.id ?? this.key;
+        const text = `${id}:${timestamp}: ${message}`;
+        if (o)
+            console.debug(text, o);
+        else
+            console.debug(text);
+
+        this.eventTarget.dispatchEvent(new CustomEvent('trace', { detail: { message: text } }));
+    }
+  
+    set tracing(enabled) {
+        if (enabled)
+            this.trace = this._trace.bind(this);
+        else
+            this.trace = noop;
+    }
+
+    get tracing() {
+        return this.trace !== noop;
     }
 
     setStatus(value) {
         if (this.state.status === value) return;
         this.state.status = value;
         this.trace(`STATE ${value}`);
-        this.eventTarget.dispatchEvent(new CustomEvent('statuschange', { detail: { status: value } }));
+        this.eventTarget.dispatchEvent(new CustomEvent('status', { detail: { status: value } }));
     }
 
-    terminate() {
-        this.setStatus('terminated');
-        
-        clearTimeout(this.watchdogTimeoutId);
-        clearTimeout(this.imageLoopTimeoutId);
-        clearTimeout(this.fetchImageTimeoutId);
-        clearTimeout(this.terminationTimeoutId);
-        
-        this.watchdogTimeoutId = undefined;
-        this.imageLoopTimeoutId = undefined;
-        this.fetchImageTimeoutId = undefined;
-        this.terminationTimeoutId = undefined;
-
-        this.state.reconnectDate = 0;
-
-        this.endCall(this.state.call);
+    get status() {
+        return this.state.status;
     }
-
+        
     get background() {
         return localStorage.getItem(`webrtc.${this.key}.background`)?.toLowerCase() === 'true';
     }
 
     set background(value) {
         localStorage.setItem(`webrtc.${this.key}.background`, value);
-        this.eventTarget.dispatchEvent(new CustomEvent('backgroundchange', { detail: { background: value } }));
+        this.eventTarget.dispatchEvent(new CustomEvent('background', { detail: { background: value } }));
     }
 
     get microphone() {
@@ -650,10 +661,10 @@ class WebRTCsession {
 
     set microphone(value) {
         // todo: toggle microphone currently causes session key change and requires call to be restarted
-        localStorage.setItem(`webrtc.${this.key}.microphone`, value);
+        localStorage.setItem(`webrtc.${this.key}.microphone`, value);        
         if (this.isStreaming)
-            this.restart(this.state.call);
-        this.eventTarget.dispatchEvent(new CustomEvent('microphonechange', { detail: { microphone: value } }));
+            this.restartCall();
+        this.eventTarget.dispatchEvent(new CustomEvent('microphone', { detail: { microphone: value } }));
     }
 
     get isTerminated() {
@@ -661,13 +672,16 @@ class WebRTCsession {
     }
 
     get isStreaming() {
-        const pc = this.state.call?.peerConnection;
+        const call = this.getActiveCall();
+        if (!call) return false;
+
+        const pc = call.peerConnection;
         if (!pc) return false;
     
         const iceState = pc.iceConnectionState;
         if (!(iceState === "connected" || iceState === "completed")) return false;
     
-        const remoteStream = this.state.call?.remoteStream;
+        const remoteStream = call.remoteStream;
         if (!remoteStream) return false;
     
         const hasActiveTracks = remoteStream.getTracks().some(track => track.readyState === 'live');
@@ -675,7 +689,10 @@ class WebRTCsession {
     }
 
     get isStreamingAudio() {
-        const remoteStream = this.state.call?.remoteStream;
+        const call = this.getActiveCall();
+        if (!call) return false;
+
+        const remoteStream = call.remoteStream;
         if (!remoteStream) return false;
     
         const audioTracks = remoteStream.getAudioTracks();
@@ -684,6 +701,112 @@ class WebRTCsession {
         return audioTracks.some(track => track.readyState === 'live');
     }
 
+    async startCall() {
+        if (this.config.video === false && this.config.audio === false) {
+            this.trace('WebRTC disabled');
+            return;
+        }
+        
+        for (const [id, call] of new Map(this.state.calls)) {
+            await this.endCall(call);  
+        }
+
+        const now = Date.now();
+        const seconds = Math.floor((now / 1000) % 60);
+        const minutes = Math.floor((now / 60000) % 60);
+        const salt = `${minutes.toString().padStart(2, '0')}${seconds.toString().padStart(2, '0')}`;
+
+        const call = {
+            id: `${this.key}_${salt}`,
+            startDate: now,
+            reconnectDate: 0,
+            signalingChannel: null,
+            peerConnection: null,
+            localStream: null,
+            remoteStream: null
+        };
+
+        this.state.calls.set(call.id, call);
+
+        try {
+            this.trace(`Call started`);
+            this.setStatus('connecting');
+            this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
+
+            if (this.microphone) {
+                // Acquire microphone for two-way audio
+                if (window.isSecureContext && navigator.mediaDevices) {
+                    try {
+                        call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                        this.trace('Microphone access granted.');
+                    }
+                    catch (err) {
+                        this.trace(`Failed to access microphone: ${err.name}:${err.message}`);
+                    }
+                }
+                else {
+                    this.trace(`Microphone not available in this context.`);
+                }
+            }
+
+            await this.openSignalingChannel(call, this.config.url_type);
+            this.createPeerConnection(call);
+
+            if (this.config.video !== false) {
+                call.peerConnection.addTransceiver('video', { direction: 'recvonly' });
+                this.trace('Configured video transceiver: receive-only.');
+            }
+
+            if (call.localStream && call.localStream.getAudioTracks().length > 0) {
+                call.localStream.getTracks().forEach(track => {
+                    call.peerConnection.addTrack(track, call.localStream);
+                });
+
+                if (this.config.audio === false) {
+                    call.peerConnection.getTransceivers().forEach(transceiver => {
+                        if (transceiver.sender.track?.kind === 'audio') {
+                            transceiver.direction = 'sendonly';
+                            this.trace('Configured audio transceiver: send-only.');
+                        }
+                    });
+                }
+                else {
+                    this.trace('Configured two-way audio.');
+                }
+            }
+            else if (this.config.audio !== false) {
+                call.peerConnection.addTransceiver('audio', { direction: 'recvonly' });
+                this.trace('Configured audio transceiver: receive-only.');
+            }
+
+            const offer = await call.peerConnection.createOffer({
+                voiceActivityDetection: false,
+                iceRestart: true
+            });
+            this.trace('Offer created.');
+    
+            await call.peerConnection.setLocalDescription(offer);
+            this.trace('Local description set successfully.');
+    
+            if (call.signalingChannel) {
+                this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
+                await call.signalingChannel.sendOffer(offer);
+                this.trace('Offer sent via signaling channel.');
+            } 
+            else {
+                throw new Error('Signaling channel is not available.');
+            }
+        } catch (err) {
+            this.lastError = `Error establishing WebRTC call. ${err.name}: ${err.message}`;
+            this.trace(this.lastError);
+            this.setStatus('error');
+
+            //this.extendCallTimeout(WebRTCsession.TIMEOUT_ERROR);
+            await this.endCall(call);
+        }
+        return call;
+    }
+    
     async endCall(call) {
 
         if (!call) return;
@@ -733,103 +856,17 @@ class WebRTCsession {
         call.localStream = null;
 
         this.setStatus('disconnected');
-        this.state.call = null;
+        this.state.calls.delete(call.id);
         this.trace('Call ended');
 
+        this.timeoutCall(call);
         this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: false} }));        
     }
 
-    createCallId(startDate) {
-        const seconds = Math.floor((startDate / 1000) % 60);
-        const minutes = Math.floor((startDate / 60000) % 60);
-        const result = `${minutes.toString().padStart(2, '0')}${seconds.toString().padStart(2, '0')}`;
-        return this.key + '_' + result;
-    }
-
-    traceCall(call, message) {
-        this.trace(`${call?.id}: ${message}`);
-    }
-
-    async startCall() {
-        if (this.config.video === false && this.config.audio === false) {
-            this.trace('WebRTC disabled');
-            return;
-        }
-
-        const now = Date.now();
-        const call = {
-            id: this.createCallId(now),
-            startDate: now,
-            signalingChannel: null,
-            peerConnection: null,
-            localStream: null,
-            remoteStream: null
-        };
-
-        if (this.state.call) {
-            this.trace(`Terminating existing call ${this.state.call.id} before starting new call.`);
-            this.endCall(this.state.call);
-        }
-
-        this.state.call = call;
-
-        this.trace(`Call started`);
-        this.setStatus('connecting');
-        this.extendConnectionTimeout(WebRTCsession.TIMEOUT_SIGNALING);
-
-        if (this.microphone) {
-            // Acquire microphone for two-way audio
-            if (window.isSecureContext && navigator.mediaDevices) {
-                try {
-                    call.localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                }
-                catch (err) {
-                    this.trace(`Failed to open microphone: ${err.name}:${err.message}`);
-                }
-            }
-        }
-
-        await this.openSignalingChannel(call, this.config.url_type);
-        this.createPeerConnection(call);
-
-        if (call.localStream) {
-            call.localStream.getTracks().forEach(track => {
-                call.peerConnection.addTrack(track, call.localStream);
-            });
-        }
-
-        if (this.config.video !== false)
-            call.peerConnection.addTransceiver('video', { direction: 'recvonly' });
-        if (this.config.audio !== false)
-            call.peerConnection.addTransceiver('audio', { direction: 'recvonly' });
-
-        this.trace("Added transceivers");
-
-        let offer;
-        try {
-            offer = await call.peerConnection.createOffer();
-        }
-        catch (err) {
-            this.lastError = `Failed to create WebRTC offer. ${err.name}: ${err.message}`;
-            this.trace(this.lastError);
-            this.setStatus('error');
-            this.extendConnectionTimeout(WebRTCsession.TIMEOUT_ERROR);
-            setTimeout(() => this.endCall(call), 0);
-            return;
-        }
-        await call.peerConnection.setLocalDescription(offer);
-
-        if (call.signalingChannel) {
-            this.extendConnectionTimeout(WebRTCsession.TIMEOUT_SIGNALING);
-            call.signalingChannel.sendOffer(offer);
-            this.trace('Sent offer');
-        }
-        else {
-            this.trace('Cannot send offer. Signaling channel invalid');
-        }
-    }
-
     createPeerConnection(call) {
+
+        if (!call) return;
+
         if (call.peerConnection) {
             this.trace("Existing peer connection detected. Closing first.");
             try { call.peerConnection.close(); } catch { }
@@ -842,19 +879,19 @@ class WebRTCsession {
         pc.oniceconnectionstatechange = () => {
             this.trace(`ICE state: ${pc.iceConnectionState}`);
 
-            const state = pc.iceConnectionState;
-            switch (state) {
+            const iceState = pc.iceConnectionState;
+            switch (iceState) {
                 case "completed":
                 case "connected":
                     this.setStatus('connected');
                     this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: true} }));
-                    this.extendConnectionTimeout(WebRTCsession.TIMEOUT_RENDERING);
+                    this.extendCallTimeout(call, WebRTCsession.TIMEOUT_RENDERING);
                     break;
 
                 case "failed":
                 case "closed":
                 case "disconnected":
-                    this.restart(call);
+                    this.restartCall(call);
                     break;
             }
         };
@@ -865,7 +902,7 @@ class WebRTCsession {
                 return;
             }
             if (ev.candidate) {
-                this.extendConnectionTimeout(WebRTCsession.TIMEOUT_SIGNALING);
+                this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
                 call.signalingChannel.sendCandidate(ev.candidate);
                 this.trace(`Sent ICE candidate '${ev.candidate.candidate}'`);
             } else {
@@ -875,18 +912,35 @@ class WebRTCsession {
         };
 
         pc.ontrack = ev => {
-            this.trace('Received track');
+            const track = ev.track;
+            this.trace(`Received ${track.kind} track ${track.id}`);
+
             if (!call.remoteStream) {
                 call.remoteStream = new MediaStream();
+            }
+            
+            if (track.kind === 'audio' && this.config.audio === false) return;
+            if (track.kind === 'video' && this.config.video === false) return;
+
+            if (!call.remoteStream.getTracks().some(t => t.id === track.id)) {
+                
+                call.remoteStream.addTrack(ev.track);
                 this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: call.remoteStream } }));
             }
-            call.remoteStream.addTrack(ev.track);
+        };
+
+        pc.onremovestream = (ev) => {
+            this.trace('Remote stream removed');
+            call.remoteStream = null;
+            this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: call.remoteStream } }));
         };
 
         call.peerConnection = pc;
     }
 
     async openSignalingChannel(call, url_type = 'webrtc-babycam') {
+        if (!call) return;
+
         let url;
         let signalingChannel = null;
 
@@ -976,7 +1030,6 @@ class WebRTCsession {
                     this.lastError = err.message;
                     this.trace(this.lastError);
                     this.setStatus('error');
-                    this.extendConnectionTimeout(WebRTCsession.TIMEOUT_ERROR);
                 }
             };
 
@@ -985,7 +1038,6 @@ class WebRTCsession {
                 this.lastError = err.message;
                 this.trace(this.lastError);
                 this.setStatus('error');
-                this.extendConnectionTimeout(WebRTCsession.TIMEOUT_ERROR);
             };
 
             signalingChannel.ontrace = (message) => {
@@ -1074,7 +1126,7 @@ class WebRTCsession {
             timestamp: Date.now()
         };
         this.state.image = image;
-        this.eventTarget.dispatchEvent(new CustomEvent('imagechange', { detail: { image: image } }));
+        this.eventTarget.dispatchEvent(new CustomEvent('image', { detail: { image: image } }));
 
         if (previousImage) {
             this.trace(`Image updated after ${image.timestamp - previousImage.timestamp}ms`);
@@ -1141,6 +1193,7 @@ class WebRTCbabycam extends HTMLElement {
         WebRTCbabycam.instanceCount += 1;
         this.instanceId = WebRTCbabycam.instanceCount;
 
+        this.rendered = false;
         this.waitStartDate = null;
         this.isVisibleInViewport = false;
         this.observersActive = false;
@@ -1148,10 +1201,11 @@ class WebRTCbabycam extends HTMLElement {
         this.resizeObserver = null;
         this.visibilityObserver = null;
         this.updateVisibility = noop;
+        
 
         this._cardConfig = null;
         this._cardMedia = null;
-        this._session = null;
+        this._cardSession = null;
 
         this.handleVisibilityChange = this.handleVisibilityChange.bind(this);
         this.handleWindowFocus = this.handleWindowFocus.bind(this);
@@ -1159,6 +1213,8 @@ class WebRTCbabycam extends HTMLElement {
         this.handleDocumentClick = this.handleDocumentClick.bind(this);
         this.handleSessionEvent = this.handleSessionEvent.bind(this); 
         this.handleMediaEvent = this.handleMediaEvent.bind(this); 
+
+        this.playTimeoutId = undefined;
     }
 
     get config() {
@@ -1170,7 +1226,7 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     get session() {
-        return this._session;
+        return this._cardSession;
     }
 
     get header() {
@@ -1248,7 +1304,7 @@ class WebRTCbabycam extends HTMLElement {
         }
     }
 
-    renderCard(video, muted, background) {
+    renderContainer(video, muted) {
         this.shadowRoot.innerHTML = `
         <style> 
             ha-card {
@@ -1410,8 +1466,7 @@ class WebRTCbabycam extends HTMLElement {
         `;
 
         const container = this.shadowRoot.querySelector('.media-container');
-
-        this._cardMedia = this.createMedia(video, muted, background);
+        this._cardMedia = this.createMedia(video, muted);
         container.insertBefore(this._cardMedia, container.querySelector('.state'));
     }
 
@@ -1660,9 +1715,8 @@ class WebRTCbabycam extends HTMLElement {
             }
         };
         document.addEventListener('keyup', handleKeyUp, true);
-        
-        document.addEventListener('mousedown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
         document.addEventListener('keydown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
+        document.addEventListener('mousedown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
         
         WebRTCbabycam.initialStaticSetupComplete = true;
     }
@@ -1722,35 +1776,36 @@ class WebRTCbabycam extends HTMLElement {
 
     handleSessionEvent(ev) {
         switch (ev.type) {
-            case 'statuschange':
-                this.updateVolume();
-                this.updateMicrophone();
-                this.updateStatus();
+            case 'status':
+                this.renderVolume();
+                this.renderMicrophone();
+                this.renderState();
                 break;
-
             case 'remotestream':
-                // todo: revisit this.loadRemoteStream();
-                break;
-            case 'backgroundchange':
-                if (!ev.detail.background) {
-                    [...this.session.state.cards].forEach(otherCard => {
-                        if (otherCard !== this && otherCard.isVisibleInViewport === false) {
-                            otherCard.handleVisibilityChange(false, false);
-                        }
-                    });
+                
+                const remoteStream = this.session?.getActiveCall()?.remoteStream;
+                if (remoteStream) {
+                    this.loadRemoteStream();
+                } else {
+                    this.unloadRemoteStream();
                 }
-                this.updateVolume();
+                break;
+            case 'background':
+                if (!ev.detail.background) {
+                    this.releaseOtherBackgroundCards();
+                }
+                this.renderVolume();
                 break;
             case 'heartbeat':
-                this.live(ev.detail.live);
-                this.updateStatus();
-                this.updateVolume();
+                this.live(ev.detail.live && this.isPlaying);
+                this.renderState();
+                this.renderVolume();
                 break;
-            case 'microphonechange':
-                this.updateMicrophone();
+            case 'microphone':
+                this.renderMicrophone();
                 break;
-            case 'imagechange':
-                this.updateImage(ev.detail.image);
+            case 'image':
+                this.renderImage(ev.detail.image);
                 break;
             case 'trace':
                 this.appendTrace(ev.detail.message);
@@ -1763,22 +1818,23 @@ class WebRTCbabycam extends HTMLElement {
             case 'mute':
                 if (ev.detail.mute) {
                     this.muteMedia();
-                }
-                else {
+                } else {
                     this.unmuteMedia();
                 }
-                this.updateStatus();
-                this.updateVolume();
                 break;
             case 'unmuteEnabled':
-                if (this.media?.classList.contains('unmute-pending'))
-                    this.unmuteMedia();
+                if (ev.detail.unmuteEnabled) {
+                    if (this.media?.classList.contains('unmute-pending')) {
+                        this.unmuteMedia();
+                    }
+                }
                 break;
             case 'connected':
-                if (ev.detail.connected)
-                    this.loadRemoteStream(true);
-                else
+                if (ev.detail.connected) {
+                    this.loadRemoteStream();
+                } else {
                     this.unloadRemoteStream();
+                }
                 break;
             default:
                 console.warn(`Unhandled session event type: ${ev.type}`);
@@ -2003,8 +2059,7 @@ class WebRTCbabycam extends HTMLElement {
                 // Synchronize the spin animation based on current time
                 const now = Date.now();
                 const elapsed = now % 1000; 
-                const animationDuration = 1000; 
-                const negativeDelay = -(elapsed / animationDuration); 
+                const negativeDelay = -(elapsed / 1000);
     
                 // Apply the negative animation-delay to synchronize
                 stateIcon.style.animationDelay = `${negativeDelay}s`;
@@ -2014,9 +2069,10 @@ class WebRTCbabycam extends HTMLElement {
             }
         }
 
-        if (show === true)
+        const currentShow = stateIcon.classList.contains('show');
+        if (show === true && !currentShow)
             stateIcon.classList.add('show');
-        else if (show === false)
+        else if (show === false && currentShow)
             stateIcon.classList.remove('show');
     }
 
@@ -2038,7 +2094,7 @@ class WebRTCbabycam extends HTMLElement {
         return paused;
     }
 
-    updateStatus() {
+    renderState() {
 
         if (this.config?.video === false && this.config?.audio === false) {
             // pure image mode => no streaming icon
@@ -2054,20 +2110,20 @@ class WebRTCbabycam extends HTMLElement {
         const paused = this.isPaused;
 
         const waitedTooLong = WebRTCsession.TIMEOUT_RENDERING;
-        let iconToShow = null;
+        let icon = null;
 
         switch (status) {
             case undefined:
             case null:
                 this.waitStartDate = Date.now();
                 this.setStateIcon("mdi:heart-broken", true);
-                this.updateImage(null);
+                this.renderImage(null);
                 return;  
 
             case 'terminated':
                 this.waitStartDate = Date.now();
                 this.setStateIcon("mdi:emoticon-dead", true);
-                this.updateImage(null);
+                this.renderImage(null);
                 return;  
 
             case 'reset':
@@ -2084,8 +2140,8 @@ class WebRTCbabycam extends HTMLElement {
                 // fall through to connecting
 
             case 'connecting':
-                iconToShow = (media?.tagName === 'AUDIO') ? "mdi:volume-mute" : "mdi:loading";
-                setTimeout(() => this.updateStatus(), waitedTooLong);
+                icon = (media?.tagName === 'AUDIO') ? "mdi:volume-mute" : "mdi:loading";
+                setTimeout(() => this.renderState(), waitedTooLong);
                 break;
 
             default:
@@ -2098,15 +2154,14 @@ class WebRTCbabycam extends HTMLElement {
             const showStats = WebRTCsession.globalStats || (this.config.stats && WebRTCsession.globalStats !== false);
             if (showStats) {
                 this.header = session?.state?.statistics ?? "";
-            }
-            else {
+            } else {
                 this.header = "";
             }
             this.setStateIcon(null, false);
-            iconToShow = (media?.tagName === 'AUDIO') ? "mdi:volume-high" : "mdi:play";
+            icon = (media?.tagName === 'AUDIO') ? "mdi:volume-high" : "mdi:play";
         }
         else if (paused) {
-            iconToShow = (media?.tagName === 'AUDIO') ? "mdi:volume-off" : "mdi:pause";
+            icon = (media?.tagName === 'AUDIO') ? "mdi:volume-off" : "mdi:pause";
         }
 
         if (session?.isStreaming) {
@@ -2114,21 +2169,21 @@ class WebRTCbabycam extends HTMLElement {
                 if (session.background) 
                     this.setStateIcon("mdi:pin", true);
                 else if (media.muted && this.config.muted === false) 
-                    this.setStateIcon(iconToShow, true);
+                    this.setStateIcon(icon, true);
                 else 
-                    this.setStateIcon(iconToShow, false);
+                    this.setStateIcon(icon, false);
             }
             else {
                 switch (media.getAttribute('playing')) {
                     case 'paused':
-                        this.setStateIcon(iconToShow, true);
+                        this.setStateIcon(icon, true);
                         break;
 
                     case 'video':
                         if (session.background) 
                             this.setStateIcon("mdi:pin", true);
                         else
-                            this.setStateIcon(iconToShow, false);
+                            this.setStateIcon(icon, false);
                         break;
 
                     case 'audiovideo':
@@ -2139,7 +2194,7 @@ class WebRTCbabycam extends HTMLElement {
                         else if (!media.muted && this.config.muted === true) 
                                 this.setStateIcon("mdi:volume-high", true);
                         else 
-                            this.setStateIcon(iconToShow, false);
+                            this.setStateIcon(icon, false);
                         break;
 
                     default:
@@ -2150,14 +2205,14 @@ class WebRTCbabycam extends HTMLElement {
         else {
             // not streaming or not yet started 
             if (this.waitStartDate && (Date.now() >= this.waitStartDate + waitedTooLong)) {
-                this.setStateIcon(iconToShow, true);
+                this.setStateIcon(icon, true);
             } else {
-                this.setStateIcon(iconToShow, false);
+                this.setStateIcon(icon, false);
             }
         }
     }
 
-    updateImage(data) {
+    renderImage(data) {
         const image = this.shadowRoot.querySelector('.image');
         if (!image) return;
         if (image.getAttribute('timestamp') === data?.timestamp) return;
@@ -2179,7 +2234,7 @@ class WebRTCbabycam extends HTMLElement {
         image.src = URL.createObjectURL(data.blob);
     }
 
-    updateVolume() {
+    renderVolume() {
         const volume = this.shadowRoot.querySelector('.volume');
         if (!volume) return;
     
@@ -2204,20 +2259,22 @@ class WebRTCbabycam extends HTMLElement {
         else if (this.media.tagName === 'AUDIO') {
             // Audio only media
             
-            if (this.media.muted || !session.isStreamingAudio)  
+            if (this.media.muted || !session.isStreamingAudio)   {
                 // Muted or not active stream
                 icon = 'mdi:volume-off';
-            else
+            } else {
                 // Unmuted audio
                 icon = 'mdi:volume-high';
+            }
         }
         else if (session.isStreaming) {
             // Video stream with audio
 
-            if (this.media.muted)
+            if (this.media.muted) {
                 icon = 'mdi:volume-off';
-            else
+            } else {
                 icon = 'mdi:volume-high';
+            }
         }
     
         if (icon)
@@ -2228,14 +2285,13 @@ class WebRTCbabycam extends HTMLElement {
         volume.icon = icon;
     }
     
-    updateMicrophone() {
+    renderMicrophone() {
         const enabled = this.session?.microphone;
         const mic = this.shadowRoot.querySelector('.microphone');
         if (!mic) return;
         if (enabled) {
             mic.icon = 'mdi:microphone';
-        }
-        else {
+        } else {
             mic.icon = 'mdi:microphone-off';
         }
     }
@@ -2304,7 +2360,8 @@ class WebRTCbabycam extends HTMLElement {
         if (!config.url || !config.entity) {
             throw new Error("Missing `url` or `entity`");
         }
-        //return this.hass?.states && this.hass.states[this._cardConfig.entity];
+
+        // todo: consider checking this.hass?.states && this.hass.states[this._cardConfig.entity];
 
         if (config.ptz && !config.ptz.service) {
             throw new Error("Missing `service` for `ptz`");
@@ -2314,6 +2371,15 @@ class WebRTCbabycam extends HTMLElement {
     set hass(hass) {
         const session = this.session;
         if (session) session.hass = hass;
+    }
+
+    releaseOtherBackgroundCards()
+    {
+        [...this.session.state.cards].forEach(otherCard => {
+            if (otherCard !== this && otherCard.isVisibleInViewport === false) {
+                otherCard.handleVisibilityChange(false, false);
+            }
+        });
     }
 
     handleVisibilityChange(visible, allow_background = undefined) {
@@ -2343,10 +2409,11 @@ class WebRTCbabycam extends HTMLElement {
 
             if (!this.session) {
                 let key = WebRTCsession.key(this._cardConfig);
-                this._session = WebRTCsession.sessions.get(key);
-                if (!this._session) {
+                this._cardSession = WebRTCsession.sessions.get(key);
+                if (!this._cardSession) {
                     const configClone = JSON.parse(JSON.stringify(this._cardConfig));
-                    this._session = WebRTCsession.create(configClone);
+                    this._cardSession = WebRTCsession.create(configClone);
+                    WebRTCsession.sessions.set(key, this._cardSession);
                 }
             }
 
@@ -2357,17 +2424,14 @@ class WebRTCbabycam extends HTMLElement {
                 this.unmuteMedia();
     
             this.loadRemoteStream();
-            this.updateVolume();
-            this.updateStatus();
-            this.updateMicrophone();
+            this.live(this.isPlaying);
+            this.renderVolume();
+            this.renderState();
+            this.renderMicrophone();
         }
         else if (allow_background && this.session?.background)
         {
-            [...this.session.state.cards].forEach(otherCard => {
-                if (otherCard !== this && otherCard.isVisibleInViewport === false) {
-                    otherCard.handleVisibilityChange(false, false);
-                }
-            });
+            this.releaseOtherBackgroundCards();
         }
         else {
 
@@ -2379,7 +2443,7 @@ class WebRTCbabycam extends HTMLElement {
             }
 
             this.session?.detachCard(this, this.handleSessionEvent);
-            this._session = null;
+            this._cardSession = null;
 
             this.setControlsVisibility(false);
             this.setPTZVisibility(false);
@@ -2402,7 +2466,7 @@ class WebRTCbabycam extends HTMLElement {
     handleDocumentVisibility() {
         if (document.hidden) {
             this.isVisibleInViewport = false;
-            this.handleVisibilityChange(false, this.config?.allow_background);
+            this.handleVisibilityChange(false, this.session?.background);
         }
     }
 
@@ -2410,7 +2474,7 @@ class WebRTCbabycam extends HTMLElement {
         WebRTCsession.enableUnmute();
     }
 
-    registerExternalListeners() {
+    setupVisibilityAndResizeHandlers() {
         if (this.observersActive) return;
 
         this.observersActive = true;
@@ -2421,7 +2485,7 @@ class WebRTCbabycam extends HTMLElement {
                 this.isVisibleInViewport = isIntersecting
                 if (document.fullscreenElement) return;
 
-                this.handleVisibilityChange(this.isVisibleInViewport, this.config?.allow_background);
+                this.handleVisibilityChange(this.isVisibleInViewport, this.session?.background);
             }
         };
 
@@ -2457,7 +2521,7 @@ class WebRTCbabycam extends HTMLElement {
         document.addEventListener('click', this.handleDocumentClick, { once: true, capture: true }); 
     }
 
-    unregisterExternalListeners() {
+    removeVisibilityAndResizeHandlers() {
         if (!this.observersActive) return;
 
         this.updateVisibility = noop;
@@ -2480,30 +2544,34 @@ class WebRTCbabycam extends HTMLElement {
     */
     render() {
 
+        this.rendered = false;
+
         if (this.shadowRoot) {
             while (this.shadowRoot.firstChild) {
                 this.shadowRoot.removeChild(this.shadowRoot.firstChild);
             }
-            this.rendered = false;
-        } else {
-            // Create the shadowRoot if it doesn't exist
+        } 
+        else {
             this.attachShadow({ mode: 'open' });
         }
+        
+        const config = this.config;
     
-        const video = this.config.video;
-        const muted = this.config.muted;
-        const background = this.config.background || this.session?.background;
-        const hasMove = this.config.ptz?.data_right;
-        const hasZoom = this.config.ptz?.data_zoom_in;
-        const hasHome = this.config.ptz?.data_home;
-        const hasVol = this.config.audio !== false;
-        const hasMic = this.config.microphone;
-        const services = this.config.shortcuts?.services || this.config.shortcuts;
-        const userCardStyle = this.config.style;
+        const hasVideo = config.video;
+        const hasMove = config.ptz?.data_right;
+        const hasZoom = config.ptz?.data_zoom_in;
+        const hasHome = config.ptz?.data_home;
+        const hasVol = config.audio !== false;
+        const hasMic = config.microphone || config.allow_microphone;
+        const services = config.shortcuts?.services || config.shortcuts;
+        const userCardStyle = config.style;
+        
+        const background = config.background || this.session?.background;
+        const muted = config.audio === false || config.muted !== false || (background === true && config.muted !== true)
 
         if (!this.rendered) {
-            this.renderCard(video, muted, background);
-            this.renderPTZ(hasMove,hasZoom,hasHome,hasVol,hasMic);
+            this.renderContainer(hasVideo, muted);
+            this.renderPTZ(hasMove, hasZoom, hasHome, hasVol, hasMic);
             this.renderShortcuts(services);
             this.renderStyle(userCardStyle);
             this.renderInteractionEventListeners();
@@ -2512,15 +2580,16 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     connectedCallback() {
-
         WebRTCbabycam.globalInit();
 
-        if (this.session?.state?.cards?.has(this))
+        if (this.session?.state?.cards?.has(this)) {
             // card running in the background
+            this.setupVisibilityAndResizeHandlers();
             return;
-
+        }
+        
         this.render();
-        this.registerExternalListeners(); 
+        this.setupVisibilityAndResizeHandlers();
 
         setTimeout(() => {
             this.setControlsVisibility(false);
@@ -2530,30 +2599,27 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     disconnectedCallback() {
-        this.unregisterExternalListeners();
+        this.removeVisibilityAndResizeHandlers();
         this.isVisibleInViewport = false;
-        this.handleVisibilityChange(false, this.config?.allow_background);
+        this.handleVisibilityChange(false, this.session?.background);
     }
 
-    loadRemoteStream(play = false) {
-
+    loadRemoteStream() {
         const media = this.media;
-        const remoteStream = this.session?.state?.call?.remoteStream;
+        const remoteStream = this.session?.getActiveCall()?.remoteStream;
         
         if (!media || !remoteStream) return;
 
         if (media.srcObject === remoteStream) {
-            media.setAttribute('loaded', Date.now());
             this.trace("Reloading remote media stream");
-            return;
+        }
+        else {
+            this.trace("Loading remote media stream");
+            media.setAttribute('loaded', Date.now());
+            media.srcObject = remoteStream;
         }
 
-        this.trace("Loading remote media stream");
-
-        media.setAttribute('loaded', Date.now());
-        media.srcObject = remoteStream;
-
-        if (play && this.session?.isStreaming && !this.isPlaying) {
+        if (this.session?.isStreaming && !this.isPlaying) {
             this.playMedia();
         }
     }
@@ -2569,7 +2635,6 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     live(on) {
-
         const container = this.shadowRoot?.querySelector(".media-container");
         if (!container) return;
 
@@ -2586,7 +2651,10 @@ class WebRTCbabycam extends HTMLElement {
                     left: 20px;
                     top: 20px;
                     width: 10px;
-                    min-width: 0.5vmax;
+                    height: 10px;
+                    min-width: 10px;
+                    transform-origin: center; /* Ensures scaling is centered */
+                    transform: scale(1); /* Ensures no resizing on zoom */
                     visibility: hidden;
                     pointer-events: none;
                     z-index: 7;
@@ -2625,7 +2693,6 @@ class WebRTCbabycam extends HTMLElement {
         }
     }
 
-
     unmuteMedia() {
         const media = this.media;
         if (!media) return;
@@ -2640,18 +2707,19 @@ class WebRTCbabycam extends HTMLElement {
                 media.classList.add('unmute-pending');
             }
         }
-        this.updateStatus();
-        this.updateVolume();
+        this.renderState();
+        this.renderVolume();
     }
 
     muteMedia() {
+
         const media = this.media;
         if (!media) return;
 
         media.classList.remove('unmute-pending');
         media.muted = true;
-        this.updateStatus();
-        this.updateVolume();
+        this.renderState();
+        this.renderVolume();
     }
             
     toggleVolume() {
@@ -2692,10 +2760,10 @@ class WebRTCbabycam extends HTMLElement {
             this.trace("Muting media");
             this.muteMedia();
         }
-      
     }
     
     pauseMedia() {
+
         const media = this.media;
         if (!media) return;
         media.classList.add('pause-pending');
@@ -2753,15 +2821,16 @@ class WebRTCbabycam extends HTMLElement {
                 media.classList.remove('pause-pending');
             })
             .catch(err => {
+                media.classList.remove('pause-pending');
                 if (err.name == "NotAllowedError" && !media.muted && playMuted != true) {
-                    WebRTCsession.unmuteEnabled = false;
-
+                    
                     media.classList.add('unmute-pending');
                     this.trace(`${err.message}`);
                     this.trace('Unmuted play failed');
+
+                    WebRTCsession.enableUnmute(false);
                     
-                    this.media?.play();
-                     
+                    // retrying here often fails, so we need to wait for user interaction
                 }
                 else if (err.name === "AbortError") {
                     this.trace(`Media play aborted: ${err.message}`);
@@ -2772,41 +2841,37 @@ class WebRTCbabycam extends HTMLElement {
             });
     }
 
-    
-    createMedia(video, muted, background) {
+    createMedia(video, muted) {
+
         let media;
         if (video === false) {
             media = document.createElement('audio');
-        }
-        else {
+        } else {
             media = document.createElement('video');
         }
 
         media.className = 'media';
         media.setAttribute('playsinline', '');
-        media.playsinline = true;
-
         media.setAttribute('muted', '');
-
-        if (muted === false || (background === true && muted !== true)) {
-            media.classList.add('unmute-pending');
-        }
-   
         media.muted = true;
+        media.playsinline = true;
         media.controls = false;
         media.autoplay = false;
+
+        if (muted === false) {
+            media.classList.add('unmute-pending');
+        }
 
         this.trace(`Created ${media.tagName.toLowerCase()} element`);
         return media;
     }
  
-    // General handler for media events
     handleMediaEvent(ev) {
         
         const session = this.session;
         const media = this.media;
 
-        this.trace(`Media ${ev.type}`);
+        this.trace(`MEDIA ${ev.type}`);
         switch (ev.type) {
             case 'emptied':
                 this.live(false);
@@ -2818,8 +2883,8 @@ class WebRTCbabycam extends HTMLElement {
                 if (!session || session.isTerminated) return;
 
                 media.setAttribute('playing', 'paused');
-                this.updateStatus();
-                this.updateVolume();
+                this.renderState();
+                this.renderVolume();
         
                 if (media.classList.contains('pause-pending')) {
                     media.classList.remove('pause-pending');
@@ -2858,13 +2923,14 @@ class WebRTCbabycam extends HTMLElement {
                     this.unmuteMedia();
                 }
                 
+                clearTimeout(this.playTimeoutId);
                 this.playTimeoutId = setTimeout(() => {
                     
                     if (!this.isPlaying || !session?.isStreaming)
                         if (!session?.isAnyCardPlaying) {
                             this.unloadRemoteStream();
                             this.trace('Play render timeout');
-                            session?.restart();
+                            session?.restartCall();
                         }
 
                 }, WebRTCsession.TIMEOUT_RENDERING);
@@ -2879,8 +2945,8 @@ class WebRTCbabycam extends HTMLElement {
                 if (media.tagName === 'AUDIO') {
                     media.setAttribute('playing', 'audio');
                     this.live(true);
-                    this.updateStatus(); 
-                    this.updateVolume();
+                    this.renderState(); 
+                    this.renderVolume();
                     return;
                 }
 
@@ -2898,15 +2964,19 @@ class WebRTCbabycam extends HTMLElement {
                 media.setAttribute("aspect-ratio", aspectRatio);
                 media.style.setProperty(`--video-aspect-ratio`, `${aspectRatio}`);
         
-                if (!session.isStreamingAudio)
-                    media.classList.remove('unmute-pending');
-        
                 this.live(true);
-                this.updateStatus(); 
-                this.updateVolume();
+                this.renderState(); 
+                this.renderVolume();
                 break;
 
             case 'volumechange':
+                if (!media.muted && media.classList.contains('unmute-pending')) {
+                    // todo: test do we need to check for playing?
+                    debugger;
+                    media.classList.remove('unmute-pending');
+                    WebRTCsession.enableUnmute();
+                }
+                
                 if (media.tagName === 'AUDIO') {
                     // Override default audio element behavior: mute controls play/pause
                     if (media.muted)
@@ -2917,7 +2987,7 @@ class WebRTCbabycam extends HTMLElement {
                     if (this.media.controls)
                         this.setControlsVisibility(true);
                 }
-                this.updateVolume();
+                this.renderVolume();
                 break;
 
             case 'dblclick':
@@ -2945,8 +3015,6 @@ class WebRTCbabycam extends HTMLElement {
                 this.trace(`Unhandled media event: ${ev.type}`);
         }
     }
-
- 
 }
 
 customElements.define('webrtc-babycam', WebRTCbabycam);
@@ -2960,6 +3028,7 @@ const customCardRegistrationFinal = {
 };
 if (window.customCards) window.customCards.push(customCardRegistrationFinal);
 else window.customCards = [customCardRegistrationFinal];
+
 
 // Signaling Channel classes:
 class SignalingChannel {
