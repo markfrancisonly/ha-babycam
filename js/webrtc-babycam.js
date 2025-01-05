@@ -319,25 +319,7 @@ class WebRTCsession {
      * If no intervals are defined, returns undefined.
      * @returns {number} The minimum interval or default if none are set.
      */
-       getMinCardInterval() {
-        const intervals = Array.from(this.state.cards)
-            .map(card => card.config?.interval)
-            .filter(interval => typeof interval === 'number');
-
-        if (intervals.length === 0) {
-            return WebRTCsession.IMAGE_INTERVAL;
-        }
-
-        const interval = Math.min(...intervals);
-        return Math.max(10, interval);
-    }
-
-     /**
-     * Retrieves the smallest 'interval' value from all attached cards.
-     * If no intervals are defined, returns undefined.
-     * @returns {number} The minimum interval or default if none are set.
-     */
-     getMinCardInterval() {
+    getMinCardInterval() {
         const intervals = Array.from(this.state.cards)
             .map(card => card.config?.interval)
             .filter(interval => typeof interval === 'number');
