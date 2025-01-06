@@ -1,4 +1,3 @@
-
 console.info(
     `%c  WebRTC Babycam \n%c`,
     'color: orange; font-weight: bold; background: black',
@@ -1212,20 +1211,16 @@ class WebRTCbabycam extends HTMLElement {
         this.rendered = false;
         this.waitStartDate = null;
         this.isVisibleInViewport = false;
-        this.documentListeners = false;
-        
-        this.resizeObserver = null;
-        this.visibilityObserver = null;
+        this.documentVisibilityListener = false;
 
         this._cardConfig = null;
         this._cardMedia = null;
         this._cardSession = null;
-
+        
+        this.resizeObserver = null;
+        this.intersectionObserver = null;
         this.intersectionObserverCallback = this.intersectionObserverCallback.bind(this);
-
-        this.handleVisibilityChange = this.handleVisibilityChange.bind(this);
         this.handleDocumentVisibility = this.handleDocumentVisibility.bind(this);
-        this.handleDocumentClick = this.handleDocumentClick.bind(this);
         this.handleSessionEvent = this.handleSessionEvent.bind(this); 
         this.handleMediaEvent = this.handleMediaEvent.bind(this); 
 
@@ -2399,12 +2394,12 @@ class WebRTCbabycam extends HTMLElement {
     {
         [...this.session.state.cards].forEach(otherCard => {
             if (otherCard !== this && otherCard.isVisibleInViewport === false) {
-                otherCard.handleVisibilityChange(false, false);
+                otherCard.processVisibilityChange(false, false);
             }
         });
     }
 
-    handleVisibilityChange(visible, allow_background = undefined) {
+    processVisibilityChange(visible, allow_background = undefined) {
 
         const mediaEventTypes = [
             'emptied',
@@ -2517,13 +2512,13 @@ class WebRTCbabycam extends HTMLElement {
             this.isVisibleInViewport = false;
         }
         else {
-            this.visibilityObserver?.disconnect();
-            this.visibilityObserver = new IntersectionObserver(this.intersectionObserverCallback, { threshold: 0 });
-            this.visibilityObserver.observe(this); 
+            this.intersectionObserver?.disconnect();
+            this.intersectionObserver = new IntersectionObserver(this.intersectionObserverCallback, { threshold: 0 });
+            this.intersectionObserver.observe(this); 
 
             this.isVisibleInViewport = this.isElementActuallyVisible(this);
         }
-        this.handleVisibilityChange(this.isVisibleInViewport, this.session?.background);
+        this.processVisibilityChange(this.isVisibleInViewport, this.session?.background);
     }
 
     intersectionObserverCallback(entries) {
@@ -2532,19 +2527,15 @@ class WebRTCbabycam extends HTMLElement {
             this.isVisibleInViewport = isIntersecting
             if (document.fullscreenElement) return;
 
-            this.handleVisibilityChange(this.isVisibleInViewport, this.session?.background);
+            this.processVisibilityChange(this.isVisibleInViewport, this.session?.background);
         }
     };
 
-    handleDocumentClick() {
-        WebRTCsession.enableUnmute();
-    }
-
     setupVisibilityAndResizeHandlers() {
 
-        if (!this.visibilityObserver) {
-            this.visibilityObserver = new IntersectionObserver(this.intersectionObserverCallback, { threshold: 0 });
-            this.visibilityObserver.observe(this); 
+        if (!this.intersectionObserver) {
+            this.intersectionObserver = new IntersectionObserver(this.intersectionObserverCallback, { threshold: 0 });
+            this.intersectionObserver.observe(this); 
         }
 
         if (!this.resizeObserver) {
@@ -2573,27 +2564,22 @@ class WebRTCbabycam extends HTMLElement {
             }
         }
 
-        if (this.documentListeners) return;
-        this.documentListeners = true;
-        
+        if (this.documentVisibilityListener) return;
         document.addEventListener("visibilitychange", this.handleDocumentVisibility);
-        document.addEventListener('click', this.handleDocumentClick, { once: true, capture: true }); 
+        this.documentVisibilityListener = true;
     }
 
     removeVisibilityAndResizeHandlers() {
 
-        this.visibilityObserver?.disconnect();
-        this.visibilityObserver = null;
+        this.intersectionObserver?.disconnect();
+        this.intersectionObserver = null;
 
         this.resizeObserver?.disconnect();
         this.resizeObserver = null;
 
-        if (!this.documentListeners) return;
-
+        if (!this.documentVisibilityListener) return;
         document.removeEventListener("visibilitychange", this.handleDocumentVisibility);
-        document.removeEventListener('click', this.handleDocumentClick, { once: true, capture: true });
-
-        this.documentListeners = false; 
+        this.documentVisibilityListener = false; 
     }
 
     /** 
@@ -2658,7 +2644,7 @@ class WebRTCbabycam extends HTMLElement {
     disconnectedCallback() {
         this.removeVisibilityAndResizeHandlers();
         this.isVisibleInViewport = false;
-        this.handleVisibilityChange(false, this.session?.background);
+        this.processVisibilityChange(false, this.session?.background);
     }
 
     loadRemoteStream() {
@@ -3567,4 +3553,3 @@ class RTSPtoWebSignalingChannel extends SignalingChannel {
         }
     }
 }
-
