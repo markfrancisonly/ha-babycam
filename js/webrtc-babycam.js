@@ -433,19 +433,17 @@ class WebRTCsession {
         if (!call) return;
 
         this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
-
-        this.trace('Restarting call');
         await this.endCall(call);
 
         clearTimeout(this.watchdogTimeoutId);
         this.watchdogTimeoutId = undefined;
         this.timeoutCall(call);
+        
+        this.trace('Restarting call');
         this.play();
     }
 
     async terminate() {
-        this.setStatus('terminated');
-        
         clearTimeout(this.watchdogTimeoutId);
         clearTimeout(this.imageLoopTimeoutId);
         clearTimeout(this.fetchImageTimeoutId);
@@ -459,6 +457,8 @@ class WebRTCsession {
         for (const call of [...this.state.calls.values()]) {
             await this.endCall(call);
         }
+
+        this.setStatus('terminated');
     }
 
     attachCard(card, messageHandler) {
@@ -1212,19 +1212,18 @@ class WebRTCbabycam extends HTMLElement {
         this.rendered = false;
         this.waitStartDate = null;
         this.isVisibleInViewport = false;
-        this.observersActive = false;
+        this.documentListeners = false;
         
         this.resizeObserver = null;
         this.visibilityObserver = null;
-        this.updateVisibility = noop;
-        
 
         this._cardConfig = null;
         this._cardMedia = null;
         this._cardSession = null;
 
+        this.intersectionObserverCallback = this.intersectionObserverCallback.bind(this);
+
         this.handleVisibilityChange = this.handleVisibilityChange.bind(this);
-        this.handleWindowFocus = this.handleWindowFocus.bind(this);
         this.handleDocumentVisibility = this.handleDocumentVisibility.bind(this);
         this.handleDocumentClick = this.handleDocumentClick.bind(this);
         this.handleSessionEvent = this.handleSessionEvent.bind(this); 
@@ -1733,6 +1732,7 @@ class WebRTCbabycam extends HTMLElement {
         document.addEventListener('keyup', handleKeyUp, true);
         document.addEventListener('keydown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
         document.addEventListener('mousedown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
+        document.addEventListener('touchstart', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
         
         WebRTCbabycam.initialStaticSetupComplete = true;
     }
@@ -2145,6 +2145,8 @@ class WebRTCbabycam extends HTMLElement {
 
             case 'error':
                 this.setStateIcon("mdi:alert-circle", true, error);
+                // todo: break on error?
+                break;
 
             case 'disconnected':
                 if (!this.waitStartDate)
@@ -2473,78 +2475,112 @@ class WebRTCbabycam extends HTMLElement {
         }
     }
    
-    handleWindowFocus() {
-        const entries = this.visibilityObserver?.takeRecords?.() ?? [];
-        if (entries.length) {
-            this.updateVisibility(entries);
-        } else {
-            this.visibilityObserver?.unobserve(this);
-            this.visibilityObserver?.observe(this);
+    isElementActuallyVisible(element) {
+        if (!element.isConnected) {
+            return false; 
         }
+    
+        const style = window.getComputedStyle(element);
+        if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
+            return false; 
+        }
+    
+        const rect = element.getBoundingClientRect();
+    
+        const pointsToCheck = [
+            { x: rect.left, y: rect.top },
+            { x: rect.right, y: rect.top },
+            { x: rect.left, y: rect.bottom },
+            { x: rect.right, y: rect.bottom },
+        ];
+    
+        // Check if any corner is visible
+        for (const point of pointsToCheck) {
+            if (
+                point.x >= 0 &&
+                point.y >= 0 &&
+                point.x <= (window.innerWidth || document.documentElement.clientWidth) &&
+                point.y <= (window.innerHeight || document.documentElement.clientHeight)
+            ) {
+                const elementAtPoint = document.elementFromPoint(point.x, point.y);
+                if (elementAtPoint === element || element.contains(elementAtPoint)) {
+                    return true; 
+                }
+            }
+        }
+    
+        return false;
     }
-
+    
     handleDocumentVisibility() {
         if (document.hidden) {
             this.isVisibleInViewport = false;
-            this.handleVisibilityChange(false, this.session?.background);
         }
+        else {
+            this.visibilityObserver?.disconnect();
+            this.visibilityObserver = new IntersectionObserver(this.intersectionObserverCallback, { threshold: 0 });
+            this.visibilityObserver.observe(this); 
+
+            this.isVisibleInViewport = this.isElementActuallyVisible(this);
+        }
+        this.handleVisibilityChange(this.isVisibleInViewport, this.session?.background);
     }
+
+    intersectionObserverCallback(entries) {
+        const isIntersecting = entries[entries.length - 1].isIntersecting;
+        if (this.isVisibleInViewport !== isIntersecting) {
+            this.isVisibleInViewport = isIntersecting
+            if (document.fullscreenElement) return;
+
+            this.handleVisibilityChange(this.isVisibleInViewport, this.session?.background);
+        }
+    };
 
     handleDocumentClick() {
         WebRTCsession.enableUnmute();
     }
 
     setupVisibilityAndResizeHandlers() {
-        if (this.observersActive) return;
 
-        this.observersActive = true;
-
-        this.updateVisibility = (entries) => {
-            const isIntersecting = entries[entries.length - 1].isIntersecting;
-            if (this.isVisibleInViewport !== isIntersecting) {
-                this.isVisibleInViewport = isIntersecting
-                if (document.fullscreenElement) return;
-
-                this.handleVisibilityChange(this.isVisibleInViewport, this.session?.background);
-            }
-        };
-
-        this.visibilityObserver = new IntersectionObserver(this.updateVisibility, { threshold: 0 });
-        this.visibilityObserver.observe(this); 
-
-        const container = this.shadowRoot.querySelector('.media-container');
-        const ptz = this.shadowRoot.querySelector('.ptz');
-        const ptzStyle = ptz ? window.getComputedStyle(ptz) : null;
-        if (ptzStyle) {
-            const ptzHeight = Number(ptzStyle.getPropertyValue("--ptz-height").replace('px', ''));
-            const resize = new ResizeObserver(entries => {
-                for (const entry of entries) {
-                    const { inlineSize: width, blockSize: availableheight } = entry.contentBoxSize[0];
-                    if (availableheight > 0) {
-                        let scale;
-                        if (ptzHeight > availableheight)
-                            scale = availableheight / ptzHeight;
-                        else if (window.matchMedia("(pointer: fine)").matches)
-                            scale = 1;
-                        else
-                            scale = 1;
-                        this.style.setProperty(`--ptz-scale`, `${scale}`);
-                    }
-                }
-            });
-            resize.observe(container);
-            this.resizeObserver = resize;
+        if (!this.visibilityObserver) {
+            this.visibilityObserver = new IntersectionObserver(this.intersectionObserverCallback, { threshold: 0 });
+            this.visibilityObserver.observe(this); 
         }
 
-        window.addEventListener('focus', this.handleWindowFocus);
+        if (!this.resizeObserver) {
+            const container = this.shadowRoot.querySelector('.media-container');
+            const ptz = this.shadowRoot.querySelector('.ptz');
+            const ptzStyle = ptz ? window.getComputedStyle(ptz) : null;
+            if (ptzStyle) {
+                const ptzHeight = Number(ptzStyle.getPropertyValue("--ptz-height").replace('px', ''));
+                const resize = new ResizeObserver(entries => {
+                    for (const entry of entries) {
+                        const { inlineSize: width, blockSize: availableheight } = entry.contentBoxSize[0];
+                        if (availableheight > 0) {
+                            let scale;
+                            if (ptzHeight > availableheight)
+                                scale = availableheight / ptzHeight;
+                            else if (window.matchMedia("(pointer: fine)").matches)
+                                scale = 1;
+                            else
+                                scale = 1;
+                            this.style.setProperty(`--ptz-scale`, `${scale}`);
+                        }
+                    }
+                });
+                resize.observe(container);
+                this.resizeObserver = resize;
+            }
+        }
+
+        if (this.documentListeners) return;
+        this.documentListeners = true;
+        
         document.addEventListener("visibilitychange", this.handleDocumentVisibility);
         document.addEventListener('click', this.handleDocumentClick, { once: true, capture: true }); 
     }
 
     removeVisibilityAndResizeHandlers() {
-        if (!this.observersActive) return;
-
-        this.updateVisibility = noop;
 
         this.visibilityObserver?.disconnect();
         this.visibilityObserver = null;
@@ -2552,11 +2588,12 @@ class WebRTCbabycam extends HTMLElement {
         this.resizeObserver?.disconnect();
         this.resizeObserver = null;
 
-        window.removeEventListener('focus', this.handleWindowFocus);
+        if (!this.documentListeners) return;
+
         document.removeEventListener("visibilitychange", this.handleDocumentVisibility);
         document.removeEventListener('click', this.handleDocumentClick, { once: true, capture: true });
 
-        this.observersActive = false; 
+        this.documentListeners = false; 
     }
 
     /** 
