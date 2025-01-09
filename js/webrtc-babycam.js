@@ -25,13 +25,12 @@ class WebRTCsession {
     })();
 
     // Timeout configurations in milliseconds
-    static TIMEOUT_SIGNALING = 10000;
-    static TIMEOUT_ICE = 10000;
-    static TIMEOUT_RENDERING = 10000;
-    static TIMEOUT_ERROR = 30000;
-    static TIMEOUT_IMAGE = 10000;
-    static IMAGE_INTERVAL = 3000;
-    static TERMINATION_DELAY = WebRTCsession.IMAGE_INTERVAL;
+    static SIGNALING_TIMEOUT_MS = 10000;
+    static ICE_TIMEOUT_MS = 10000;
+    static RENDERING_TIMEOUT_MS = 10000;
+    static IMAGE_FETCH_TIMEOUT_MS = 10000;
+    static IMAGE_FETCH_INTERVAL_MS = 3000;
+    static SESSION_TERMINATION_DELAY_MS = WebRTCsession.IMAGE_FETCH_INTERVAL_MS;
 
     constructor(key, hass, config) {
         if (!config || !config.entity) {
@@ -77,24 +76,22 @@ class WebRTCsession {
     static key(config) {
         let key = config.entity.replace(/[^a-z0-9A-Z_-]/g, '-');
 
-        // default true
+        // todo: move defaults out of constructor
         if (config.audio === false) key += '-a';
         if (config.video === false) key += '-v';
 
-        // default false
-        if (config.microphone !== true) key += '-m';
         return key;
     }
 
-    static create(config) {
+    static getInstance(config) {
         let hass = document.body.querySelector("home-assistant")?.hass;
         let key = WebRTCsession.key(config);
         let session = WebRTCsession.sessions.get(key);
         if (!session) {
             session = new WebRTCsession(key, hass, config);
             WebRTCsession.sessions.set(key, session);
+            console.debug(`****** created session ${key} #${WebRTCsession.sessions.size}`);
         }
-        console.debug(`****** created session ${key} #${WebRTCsession.sessions.size}`);
         return session; 
     }
 
@@ -309,6 +306,11 @@ class WebRTCsession {
         return hasCardPlaying;
     }
 
+    get isAnyCardPlayingVideo() {
+        const hasCardPlayingVideo = [...this.state.cards].some(card => card.isPlayingVideo === true);
+        return hasCardPlayingVideo;
+    }
+
     get isStatsEnabled() {
         return WebRTCsession.globalStats || [...this.state.cards].some(card => card.config?.stats);
     }
@@ -324,7 +326,7 @@ class WebRTCsession {
             .filter(interval => typeof interval === 'number');
 
         if (intervals.length === 0) {
-            return WebRTCsession.IMAGE_INTERVAL;
+            return WebRTCsession.IMAGE_FETCH_INTERVAL_MS;
         }
 
         const interval = Math.min(...intervals);
@@ -348,7 +350,7 @@ class WebRTCsession {
             this.imageLoop();
         }, interval);
 
-        if (this.isAnyCardPlaying) return;
+        if (this.isAnyCardPlayingVideo) return;
         this.fetchImage();
     }
 
@@ -383,7 +385,7 @@ class WebRTCsession {
             else if (Date.now() < call.reconnectDate) {
                 // Connecting or previously connected, extend reconnection if streaming
                 if (live) {
-                    this.extendCallTimeout(call, WebRTCsession.TIMEOUT_RENDERING);
+                    this.extendCallTimeout(call, WebRTCsession.RENDERING_TIMEOUT_MS);
                     if (isStatsEnabled) {
                         await this.getPeerConnectionStats(call);
                     }
@@ -428,10 +430,12 @@ class WebRTCsession {
     }
 
     async restartCall(call) {
+        // todo: handle rekey for video, audio, microphone changes
+
         call = call ?? this.activeCall;
         if (!call) return;
 
-        this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
+        this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
         await this.endCall(call);
 
         clearTimeout(this.watchdogTimeoutId);
@@ -555,51 +559,52 @@ class WebRTCsession {
                 this.trace("Terminating session");
                 this.terminate();
             }
-        }, WebRTCsession.TERMINATION_DELAY);
+        }, WebRTCsession.SESSION_TERMINATION_DELAY_MS);
         this.trace("Termination scheduled");
     }
     
     /**
      * Invoked whenever the browser is expected to allow unmuted audio play 
      */
-    static enableUnmute(value = true) {
+    static async enableUnmute(value = true) {
         if (WebRTCsession.unmuteEnabled === value) return;
-            
-        WebRTCsession.unmuteEnabled = value;
 
-        const iterator = WebRTCsession.sessions.values();
-        for (const session of iterator) {
+        WebRTCsession.unmuteEnabled = value;
+        console.debug(`Unmute ${WebRTCsession.unmuteEnabled ? 'enabled' : 'disabled'}`);
+
+        const sessions = [...WebRTCsession.sessions.values()];
+        for (const session of sessions) {
             session.eventTarget.dispatchEvent(new CustomEvent('unmuteEnabled', { detail: { unmuteEnabled: value } }));
         }
     }
         
-    static toggleGlobalMute() {
+    static async toggleGlobalMute() {
         WebRTCsession.globalMute = !WebRTCsession.globalMute;
         console.debug(`Global mute ${WebRTCsession.globalMute ? 'enabled' : 'disabled'}`);
         
-        const iterator = WebRTCsession.sessions.values();
-        for (const session of iterator) {
+        const sessions = [...WebRTCsession.sessions.values()];
+        for (const session of sessions) {
             session.eventTarget.dispatchEvent(new CustomEvent('mute', { detail: { mute: WebRTCsession.globalMute } }));
         }
     }
 
-    static toggleGlobalDebug() {
+    static async toggleGlobalDebug() {
         WebRTCsession.globalDebug = !WebRTCsession.globalDebug;
         console.debug(`Global debug mode ${WebRTCsession.globalDebug ? 'enabled' : 'disabled'}`);
         
-        const iterator = WebRTCsession.sessions.values();
-        for (const session of iterator) {
+        const sessions = [...WebRTCsession.sessions.values()];
+        for (const session of sessions) {
             session.tracing =  WebRTCsession.globalDebug;
             session.eventTarget.dispatchEvent(new CustomEvent('debug', { detail: { debug: WebRTCsession.globalDebug } }));
         }
     }
     
-    static toggleGlobalStats() {
+    static async toggleGlobalStats() {
         WebRTCsession.globalStats = !WebRTCsession.globalStats;
         console.debug(`Global stats mode ${WebRTCsession.globalStats ? 'enabled' : 'disabled'}`); 
 
-        const iterator = WebRTCsession.sessions.values();
-        for (const session of iterator) {
+        const sessions = [...WebRTCsession.sessions.values()];
+        for (const session of sessions) {
             session.eventTarget.dispatchEvent(new CustomEvent('stats', { detail: { stats: WebRTCsession.globalStats } }));
         }
     }
@@ -656,7 +661,6 @@ class WebRTCsession {
     }
 
     set microphone(value) {
-        // todo: toggle microphone currently causes session key change and requires call to be restarted
         localStorage.setItem(`webrtc.${this.key}.microphone`, value);        
         if (this.isStreaming)
             this.restartCall();
@@ -727,7 +731,7 @@ class WebRTCsession {
         try {
             this.trace(`Call started`);
             this.setStatus('connecting');
-            this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
+            this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
 
             if (this.microphone) {
                 // Acquire microphone for two-way audio
@@ -799,7 +803,7 @@ class WebRTCsession {
                 this.trace('Local description set successfully.');
         
                 if (call.signalingChannel) {
-                    this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
+                    this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
                     await call.signalingChannel.sendOffer(offer);
                     this.trace('Offer sent via signaling channel.');
                 } 
@@ -900,7 +904,7 @@ class WebRTCsession {
                 case "connected":
                     this.setStatus('connected');
                     this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: true} }));
-                    this.extendCallTimeout(call, WebRTCsession.TIMEOUT_RENDERING);
+                    this.extendCallTimeout(call, WebRTCsession.RENDERING_TIMEOUT_MS);
                     break;
 
                 case "failed":
@@ -917,7 +921,7 @@ class WebRTCsession {
                 return;
             }
             if (ev.candidate) {
-                this.extendCallTimeout(call, WebRTCsession.TIMEOUT_SIGNALING);
+                this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
                 call.signalingChannel.sendCandidate(ev.candidate);
                 this.trace(`Sent ICE candidate '${ev.candidate.candidate}'`);
             } else {
@@ -1005,11 +1009,11 @@ class WebRTCsession {
                 if (!url.includes('/whep'))
                     url += '/' + this.config.entity + '/whep';
             }
-            signalingChannel = new WhepSignalingChannel(url, WebRTCsession.TIMEOUT_SIGNALING);
+            signalingChannel = new WhepSignalingChannel(url, WebRTCsession.SIGNALING_TIMEOUT_MS);
         }
         else if (url_type === 'rtsptoweb') {
             url = this.config.url;
-            signalingChannel = new RTSPtoWebSignalingChannel(url, WebRTCsession.TIMEOUT_SIGNALING);
+            signalingChannel = new RTSPtoWebSignalingChannel(url, WebRTCsession.SIGNALING_TIMEOUT_MS);
         }
 
         call.signalingChannel = signalingChannel;
@@ -1059,7 +1063,7 @@ class WebRTCsession {
                 this.trace(`${message}`);
             };
 
-            await signalingChannel.open(WebRTCsession.TIMEOUT_SIGNALING);
+            await signalingChannel.open(WebRTCsession.SIGNALING_TIMEOUT_MS);
             if (signalingChannel.isOpen) {
                 this.trace(`Opened '${url}'`);
             }
@@ -1102,7 +1106,7 @@ class WebRTCsession {
                 this.fetchImageTimeoutId = setTimeout(() => {
                     abort.abort();
                     this.fetchImageTimeoutId = undefined;
-                }, WebRTCsession.TIMEOUT_IMAGE);
+                }, WebRTCsession.IMAGE_FETCH_TIMEOUT_MS);
 
                 const response = await fetch(url, {
                     signal: abort.signal,
@@ -1111,7 +1115,7 @@ class WebRTCsession {
 
                 if (response?.ok) {
                     clearTimeout(this.fetchImageTimeoutId);
-                    this.setImage(await response.blob());
+                    await this.setImage(await response.blob());
                 }
             }
             finally {
@@ -1131,13 +1135,14 @@ class WebRTCsession {
         }
     }
 
-    setImage(blob) {
+    async setImage(blob) {
         this.stats.imageBytesReceived += blob.size;
 
         const previousImage = this.state.image;
         const image = {
             blob: blob,
             size: blob.size,
+            hash: await this.hashBlob(blob),
             timestamp: Date.now()
         };
         this.state.image = image;
@@ -1151,6 +1156,12 @@ class WebRTCsession {
         }
     }
 
+    async hashBlob(blob) {
+        const buffer = await blob.arrayBuffer();
+        const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+ 
     async createThumbnail(width, height) {
         const blob = this.state.image?.blob;
         if (!blob) return null;
@@ -1209,9 +1220,8 @@ class WebRTCbabycam extends HTMLElement {
         this.instanceId = WebRTCbabycam.instanceCount;
 
         this.rendered = false;
-        this.waitStartDate = null;
+        this.playingWaitStartDate = null;
         this.isVisibleInViewport = false;
-        this.documentVisibilityListener = false;
 
         this._cardConfig = null;
         this._cardMedia = null;
@@ -1220,11 +1230,13 @@ class WebRTCbabycam extends HTMLElement {
         this.resizeObserver = null;
         this.intersectionObserver = null;
         this.intersectionObserverCallback = this.intersectionObserverCallback.bind(this);
-        this.handleDocumentVisibility = this.handleDocumentVisibility.bind(this);
-        this.handleSessionEvent = this.handleSessionEvent.bind(this); 
-        this.handleMediaEvent = this.handleMediaEvent.bind(this); 
+        this.documentVisibility = this.documentVisibility.bind(this);
+        this.documentVisibilityListener = false;
+        this.sessionEvent = this.sessionEvent.bind(this); 
+        this.mediaEvent = this.mediaEvent.bind(this); 
 
         this.playTimeoutId = undefined;
+        this.imageRefreshTimeoutId = undefined;
     }
 
     get config() {
@@ -1241,7 +1253,7 @@ class WebRTCbabycam extends HTMLElement {
 
     get header() {
         const header = this.shadowRoot.querySelector('.header');
-        return header ? header.innerHTML : '';
+        return header?.innerHTML ?? '';
     }
     set header(text) {
         const header = this.shadowRoot.querySelector('.header');
@@ -1255,7 +1267,7 @@ class WebRTCbabycam extends HTMLElement {
         const log = this.shadowRoot.querySelector('.log');
         if (!log) return;
 
-        const session = this.session;
+        const { session } = this;
         if (show) {            
             log.classList.remove('hidden');
 
@@ -1268,8 +1280,10 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     async setControlsVisibility(show) {
+        // todo: remove defunct method setControlsVisibility
+
         const timeout = 3000;
-        const media = this.media;
+        const { media } = this;
         if (!media) return;
 
         const showActive = () => {
@@ -1314,7 +1328,7 @@ class WebRTCbabycam extends HTMLElement {
         }
     }
 
-    renderContainer(video, muted) {
+    renderContainer(muted) {
         this.shadowRoot.innerHTML = `
         <style> 
             ha-card {
@@ -1343,7 +1357,7 @@ class WebRTCbabycam extends HTMLElement {
                 width: 100%;
                 background: transparent;
             }
-            video[playing="audiovideo"], video[playing="video"] {
+            video[playing="audiovideo"], video[playing="video"], video[playing="paused"] {
                 visibility: visible;
                 z-index: 2;
             }
@@ -1371,6 +1385,16 @@ class WebRTCbabycam extends HTMLElement {
             audio:hover {
                 opacity: 1;
             }
+            @keyframes blurAfter30Seconds {
+                from {
+                    filter: none;
+                    opacity: 1;
+                }
+                to {
+                    filter: blur(5px);
+                    opacity: 0.5;
+                }
+            }
             .image {
                 display: none;
                 width: 100%;
@@ -1380,6 +1404,8 @@ class WebRTCbabycam extends HTMLElement {
             }
             .image[size] {
                 display: block;
+                opacity: 1;
+                animation: blurAfter30Seconds 30s forwards;
             }
             .hidden {
                 visibility: hidden !important;
@@ -1476,7 +1502,7 @@ class WebRTCbabycam extends HTMLElement {
         `;
 
         const container = this.shadowRoot.querySelector('.media-container');
-        this._cardMedia = this.createMedia(video, muted);
+        this._cardMedia = this.createMedia(muted);
         container.insertBefore(this._cardMedia, container.querySelector('.state'));
     }
 
@@ -1738,9 +1764,10 @@ class WebRTCbabycam extends HTMLElement {
         const ptz = this.shadowRoot.querySelector('.ptz');
         const shortcuts = this.shadowRoot.querySelector('.shortcuts');
         const state = this.shadowRoot.querySelector('.state');
+        const media = this.media;
 
         container.addEventListener('mousemove', () => {
-            if (this.media?.controls)
+            if (media?.controls)
                 this.setControlsVisibility(true);
             else
                 this.setPTZVisibility(true);
@@ -1751,8 +1778,10 @@ class WebRTCbabycam extends HTMLElement {
             this.onMouseDoubleClick(container, () => this.toggleFullScreen());
         }
 
-        this.onMouseDownHold(container, () => this.setControlsVisibility(true), 800);
-        this.onTouchHold(container, () => this.setControlsVisibility(true), 800);
+        if (this.config.video !== false) {
+            this.onMouseDownHold(container, () => this.setControlsVisibility(true), 800);
+            this.onTouchHold(container, () => this.setControlsVisibility(true), 800);
+        }
 
         if (image) {
             image.addEventListener('click', () => this.session?.fetchImage());
@@ -1782,15 +1811,14 @@ class WebRTCbabycam extends HTMLElement {
         if (state) {
             state.addEventListener('click', ev => { this.buttonClick(ev.target); });
         }
- 
     }
 
-    handleSessionEvent(ev) {
+    sessionEvent(ev) {
         switch (ev.type) {
             case 'status':
-                this.renderVolume();
-                this.renderMicrophone();
-                this.renderState();
+                this.refreshVolume();
+                this.refreshMicrophone();
+                this.refreshState();
                 break;
             case 'remotestream':
                 const remoteStream = this.session?.activeCall?.remoteStream;
@@ -1804,18 +1832,18 @@ class WebRTCbabycam extends HTMLElement {
                 if (!ev.detail.background) {
                     this.releaseOtherBackgroundCards();
                 }
-                this.renderVolume();
+                this.refreshVolume();
                 break;
             case 'heartbeat':
                 this.live(ev.detail.live && this.isPlaying);
-                this.renderState();
-                this.renderVolume();
+                this.refreshState();
+                this.refreshVolume();
                 break;
             case 'microphone':
-                this.renderMicrophone();
+                this.refreshMicrophone();
                 break;
             case 'image':
-                this.renderImage(ev.detail.image);
+                this.refreshImage(ev.detail.image);
                 break;
             case 'trace':
                 this.appendTrace(ev.detail.message);
@@ -1857,7 +1885,7 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     onMouseDownHold(element, callback, ms = 500, repeatDelay = undefined) {
-        const attribute = 'mousedown';
+        const attribute = 'data-mousedown';
         const cancel = (ev) => {
             const timer = Number(element.getAttribute(attribute));
             element.removeAttribute(attribute);
@@ -1890,7 +1918,7 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     onTouchHold(element, callback, ms = 500, repeatDelay = undefined) {
-        const attribute = 'hold';
+        const attribute = 'data-hold';
         const cancel = () => {
             const timer = Number(element.getAttribute(attribute));
             element.removeAttribute(attribute);
@@ -1924,7 +1952,7 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     onDoubleTap(element, doubleTapCallback, ms = 500) {
-        const attribute = 'doubletap';
+        const attribute = 'data-doubletap';
         const cancel = () => {
             const timer = Number(element.getAttribute(attribute));
             element.removeAttribute(attribute);
@@ -1949,7 +1977,7 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     onMouseDoubleClick(element, doubleClickCallback, ms = 500) {
-        const attribute = 'doubleclick';
+        const attribute = 'data-doubleclick';
         const cancel = () => {
             const timer = Number(element.getAttribute(attribute));
             element.removeAttribute(attribute);
@@ -1966,87 +1994,59 @@ class WebRTCbabycam extends HTMLElement {
                 return;
             }
             const timer = setTimeout(() => cancel(), ms);
-            element.setAttribute('doubleclick', timer);
+            element.setAttribute(attribute, timer);
         }, true);
     }
 
-    execute(action, params) {
-        
-        const session = this.session;
-        const media = this.media;
-
-        switch (action) {
-            case 'fullscreen':
-                this.toggleFullScreen();
-                break;
-
-            case 'microphone':
-                if (session) {
-                    session.microphone = !this.session.microphone;
-                }
-                break;
-
-            case 'play':
-                // e.g. un-pause or un-mute local media
-                if (media?.paused) {
-                    media.play().catch(err => this.trace(err.message));
-                }
-                break;
-
-            case 'ptz':
-                if (session && params && params.domain && params.service) {
-                    session.hass.callService(params.domain, params.service, params.data);
-                    setTimeout(() => { session?.fetchImage(); }, 2000);
-                }
-                break;
-
-            case 'shortcut':
-                if (session && params && params.domain && params.service) {
-                    session.hass.callService(params.domain, params.service, params.data);
-                }
-                break;
-
-            case 'volume':
-                this.toggleVolume();
-                break;
-        }
-    }
-
     buttonClick(button) {
+        const { session, config } = this;
+        
         this.setPTZVisibility(true);
-
+        
         if (button.icon === 'mdi:volume-high'
             || button.icon === 'mdi:volume-off'
             || button.icon === 'mdi:pin'
             || button.icon === 'mdi:pin-off'
             || button.classList.contains('ptz-volume')) {
-            this.execute('volume');
-            return;
+                this.toggleVolume();
+                return;
         }
+
         if (button.icon === 'mdi:microphone'
             || button.icon === 'mdi:microphone-off'
             || button.classList.contains('ptz-microphone')) {
-            this.execute('microphone');
-            return;
+                if (session) {
+                    session.microphone = !this.session.microphone;
+                }
+                return;
         }
+
         if (button.icon === 'mdi:pause') {
-            this.execute('play');
+            this.playMedia();
             return;
         }
+
         if (button.dataset.index !== undefined) {
-            const shortcuts = this.config.shortcuts.services || this.config.shortcuts;
+            const shortcuts = config.shortcuts.services || config.shortcuts;
             const shortcut = shortcuts[button.dataset.index];
             if (shortcut && shortcut.service) {
                 const [domain, service] = shortcut.service.split('.', 2);
-                this.execute('shortcut', { domain: domain, service: service, data: (shortcut.service_data || {}) });
+                const data = shortcut.service_data || {};
+                if (domain && service) {
+                    session?.hass?.callService(domain, service, data);
+                }
             }
             return;
         }
 
-        const ptzData = this.config.ptz?.['data_' + button.className];
+        const ptzData = config.ptz?.['data_' + button.className];
         if (ptzData) {
-            const [domain, service] = this.config.ptz.service.split('.', 2);
-            this.execute('ptz', { domain: domain, service: service, data: ptzData });
+            const [domain, service] = config.ptz.service.split('.', 2);
+            const data = ptzData;
+            if (session && domain && service) {
+                session?.hass?.callService(domain, service, data);
+                setTimeout(() => { session?.fetchImage(); }, 2000);
+            }
             return;
         }
     }
@@ -2055,7 +2055,8 @@ class WebRTCbabycam extends HTMLElement {
         const stateIcon = this.shadowRoot.querySelector('.state');
         if (!stateIcon) return;
 
-        if (title !== undefined) {
+        const currentTitle = stateIcon.title;
+        if (title !== undefined && title != currentTitle) {
             stateIcon.title = title;
             show = true;
         }
@@ -2088,7 +2089,13 @@ class WebRTCbabycam extends HTMLElement {
 
     get isPlaying() {
         const media = this.media;
-        const playing = media && (media.getAttribute('playing') === 'video' || media.getAttribute('playing') === 'audiovideo' || media.getAttribute('playing') === 'audio');
+        const playing = media && (media.getAttribute('playing') === 'audiovideo' || media.getAttribute('playing') === 'video' || media.getAttribute('playing') === 'audio');
+        return playing;
+    }
+
+    get isPlayingVideo() {
+        const media = this.media;
+        const playing = media && (media.getAttribute('playing') === 'audiovideo' || media.getAttribute('playing') === 'video');
         return playing;
     }
  
@@ -2098,157 +2105,145 @@ class WebRTCbabycam extends HTMLElement {
         return paused;
     }
 
-    renderState() {
-
-        const showStats = WebRTCsession.globalStats || (this.config?.stats && WebRTCsession.globalStats !== false);
-        const session = this.session;
+    refreshState(reset = false) {
+        const { session, media, config } = this;
+        
         const status = session?.status;
         const error = session?.lastError;
-        const doesntplay = this.config?.video === false && this.config?.audio === false;
 
-        if (doesntplay) {
+        const audioOnly = session?.config.video === false && session?.config.audio !== false;
+        const doesntPlay = config?.video === false && config?.audio === false;
+        const showStats = WebRTCsession.globalStats || (config?.stats && WebRTCsession.globalStats !== false);
+
+        if (doesntPlay) {
             this.header = showStats ? (session?.state?.statistics ?? "") : "";
             return;
         }
 
-        const media = this.media;
         const playing = this.isPlaying;
         const paused = this.isPaused;
-        const streaming = session?.isStreaming;
 
-        const waitedTooLong = WebRTCsession.TIMEOUT_RENDERING;
-        let icon = null;
+        const waitedTooLong = WebRTCsession.RENDERING_TIMEOUT_MS;
+        let icon = undefined;
+        let show = undefined;
+        let title = undefined;
+
+        if (reset) {
+            this.playingWaitStartDate = Date.now();
+            this.setStateIcon(undefined, false, undefined);
+            setTimeout(() => this.refreshState(), waitedTooLong);
+            return;
+        }
 
         switch (status) {
             case undefined:
             case null:
-                this.waitStartDate = Date.now();
                 this.setStateIcon("mdi:heart-broken", true);
-                this.renderImage(null);
                 return;  
 
             case 'terminated':
-                this.waitStartDate = Date.now();
                 this.setStateIcon("mdi:emoticon-dead", true);
-                this.renderImage(null);
                 return;  
 
-            case 'reset':
-                this.waitStartDate = Date.now();
-                this.setStateIcon(null, false);
-                return;
-
             case 'error':
-                this.setStateIcon("mdi:alert-circle", true, error);
-                // todo: break on error?
-                break;
+                icon = "mdi:alert-circle";
+                show = true;
+                title = error;
+                // fall-through
 
             case 'disconnected':
-                if (!this.waitStartDate)
-                    this.waitStartDate = Date.now();
-                // fall through to connecting
+                if (!this.playingWaitStartDate) {
+                    this.playingWaitStartDate = Date.now(); 
+                }
+                // fall-through
 
             case 'connecting':
-                icon = (media?.tagName === 'AUDIO') ? "mdi:volume-mute" : "mdi:loading";
-                setTimeout(() => this.renderState(), waitedTooLong);
-                break;
+                icon = audioOnly ? "mdi:volume-mute" : "mdi:loading";
+                show = show || (Date.now() >= this.playingWaitStartDate + waitedTooLong);
+                this.setStateIcon(icon, show, title);
+                return;
 
-            default:
+            case 'connected':
                 break;
         }
 
-        if (playing) {
-            this.waitStartDate = null;
+        if (paused) {
+            icon = "mdi:pause";
+            show = true;
+        }
+        else if (playing) {
+            
+            const stable = Number(media.getAttribute('playing-started') ?? 0) + WebRTCsession.SESSION_TERMINATION_DELAY_MS;
+            if (Date.now() > stable) {
+                icon = null;
+            }
+            show = false;
 
+            this.playingWaitStartDate = null;
             this.header = showStats ? (session?.state?.statistics ?? "") : "";
-            this.setStateIcon(null, false);
-            icon = (media?.tagName === 'AUDIO') ? "mdi:volume-high" : "mdi:play";
-        }
-        else if (paused) {
-            icon = (media?.tagName === 'AUDIO') ? "mdi:volume-off" : "mdi:pause";
-        }
-
-        if (streaming) {
-            if (media.tagName == 'AUDIO') {
-                if (session.background) 
-                    this.setStateIcon("mdi:pin", true);
-                else if (media.muted && this.config.muted === false) 
-                    this.setStateIcon(icon, true);
-                else 
-                    this.setStateIcon(icon, false);
+                        
+            if (session.background && !config.background) {
+                icon = "mdi:pin";
+                show = true;
             }
-            else {
-                switch (media.getAttribute('playing')) {
-                    case 'paused':
-                        this.setStateIcon(icon, true);
-                        break;
-
-                    case 'video':
-                        if (session.background) 
-                            this.setStateIcon("mdi:pin", true);
-                        else
-                            this.setStateIcon(icon, false);
-                        break;
-
-                    case 'audiovideo':
-                        if (media.muted && this.config.muted === false) 
-                            this.setStateIcon("mdi:volume-mute", true);
-                        else if (session.background) 
-                            this.setStateIcon("mdi:pin", true);
-                        else if (!media.muted && this.config.muted === true) 
-                                this.setStateIcon("mdi:volume-high", true);
-                        else 
-                            this.setStateIcon(icon, false);
-                        break;
-
-                    default:
-                        break;
-                }
+            else if (media.muted && config.muted === false) {
+                icon = "mdi:volume-mute";
+                show = true;
+            }
+            else if (!media.muted && config.muted === true) {
+                icon = "mdi:volume-high";
+                show = true;
             }
         }
-        else {
-            // not streaming or not yet started 
-            if (this.waitStartDate && (Date.now() >= this.waitStartDate + waitedTooLong)) {
-                this.setStateIcon(icon, true);
-            } else {
-                this.setStateIcon(icon, false);
-            }
-        }
+
+        this.setStateIcon(icon, show, title);
     }
 
-    renderImage(data) {
+    async refreshImage(data) {
         const image = this.shadowRoot.querySelector('.image');
-        if (!image) return;
-        if (image.getAttribute('timestamp') === data?.timestamp) return;
+        if (!image || !data) return;
+        
+        const lastTimestamp = image.getAttribute('timestamp');
+        const lastHash = image.getAttribute('hash');
 
-        if (!data) {
-            image.removeAttribute('size');
-            image.removeAttribute('timestamp');
-            image.src = "data:image/svg+xml,%3Csvg%20xmlns=%22http://www.w3.org/2000/svg%22/%3E";
-            this.trace('Cleared image');
-            return;
+        if (lastTimestamp === data.timestamp) return;
+        if (lastHash && lastHash === data.hash) return;
+
+        const animation = image.getAnimations()[0];
+        animation?.cancel();
+        animation?.play();
+
+        if (lastTimestamp) {
+            try { URL.revokeObjectURL(image.src); } catch { }
         }
 
-        image.addEventListener('load', () => {
-            if (image.hasAttribute('timestamp'))
-                URL.revokeObjectURL(image.src);
-        }, { once: true });
-
-        image.setAttribute('timestamp', data.timestamp);
         image.setAttribute('size', data.size);
-        image.src = URL.createObjectURL(data.blob);
-    }
+        image.setAttribute('timestamp', data.timestamp);
+        if (data.hash) {
+            image.setAttribute('hash', data.hash);
+        }
 
-    renderVolume() {
+        const objUrl = URL.createObjectURL(data.blob);
+        image.src = objUrl;
+
+        clearTimeout(this.imageRefreshTimeoutId);
+        this.imageRefreshTimeoutId = setTimeout(() => {
+            try { URL.revokeObjectURL(objUrl); } catch { }
+        }, 30000);
+    }
+    
+    refreshVolume() {
         const volume = this.shadowRoot.querySelector('.volume');
         if (!volume) return;
     
-        let icon = null; 
-        const session = this.session;
+        const { session, config, media } = this;
         const streaming = session?.isStreaming;
         const audio = session?.isStreamingAudio;
+        const audioOnly = config.video === false && config.audio !== false;
 
-        if (!session || !streaming) {
+        let icon = null; 
+
+        if (!media || !session || !streaming) {
             // No icon to display without an active stream 
             icon = null; 
         }
@@ -2256,18 +2251,18 @@ class WebRTCbabycam extends HTMLElement {
             // Background mode enabled
             icon = 'mdi:pin';
         }
-        else if (this.config.audio === false || (streaming && !audio)) {
+        else if (config.audio === false || (streaming && !audio)) {
             // No audio stream
 
-            if (this.config.background || this.config.allow_background) {
+            if (config.background || config.allow_background) {
                 // Background mode can be enabled
                 icon = 'mdi:pin-off';  
             }
         }
-        else if (this.media.tagName === 'AUDIO') {
+        else if (audioOnly) {
             // Audio only media
             
-            if (this.media.muted || !audio)   {
+            if (media.muted || !audio)   {
                 // Audio muted or not streaming
                 icon = 'mdi:volume-off';
             } else {
@@ -2278,7 +2273,7 @@ class WebRTCbabycam extends HTMLElement {
         else if (streaming) {
             // Video stream with audio
 
-            if (this.media.muted) {
+            if (media.muted) {
                 icon = 'mdi:volume-off';
             } else {
                 icon = 'mdi:volume-high';
@@ -2287,17 +2282,16 @@ class WebRTCbabycam extends HTMLElement {
     
         if (icon && volume.parentNode.classList.contains('hidden')) {
             volume.parentNode.classList.remove('hidden');
+        } else if (!icon && !volume.parentNode.classList.contains('hidden')) {
+            volume.parentNode.classList.add('hidden');
         }
-        else if (!icon && !volume.parentNode.classList.contains('hidden')) {
-            volume.parentNode.classList.add('hidden'); 
-        }
-
-        if (volume.icon != icon) { 
+    
+        if (volume.icon !== icon) {
             volume.icon = icon;
         }
     }
     
-    renderMicrophone() {
+    refreshMicrophone() {
         const mic = this.shadowRoot.querySelector('.microphone');
         if (!mic) return;
 
@@ -2354,10 +2348,21 @@ class WebRTCbabycam extends HTMLElement {
 
     toggleFullScreen() {
         if (!document.fullscreenEnabled) return;
+
+        const { session, config } = this;
+
         if (!document.fullscreenElement) {
             this.requestFullscreen();
+            if (config?.fullscreen === 'video' && session?.config.video === false && config.video === false) {
+                session.config.video = true;
+                session.restartCall();
+            }
         } else {
             document.exitFullscreen();
+            if (config?.fullscreen === 'video' && session?.config.video === true && config.video === false) {
+                session.config.video = false;
+                session.restartCall();
+            }
         }
     }
 
@@ -2394,12 +2399,12 @@ class WebRTCbabycam extends HTMLElement {
     {
         [...this.session.state.cards].forEach(otherCard => {
             if (otherCard !== this && otherCard.isVisibleInViewport === false) {
-                otherCard.processVisibilityChange(false, false);
+                otherCard.applyVisibility(false, false);
             }
         });
     }
 
-    processVisibilityChange(visible, allow_background = undefined) {
+    applyVisibility(visible, allow_background = undefined) {
 
         const mediaEventTypes = [
             'emptied',
@@ -2419,32 +2424,28 @@ class WebRTCbabycam extends HTMLElement {
 
             if (!this.mediaEventHandlersRegistered) {
                 mediaEventTypes.forEach(event => {
-                    media.addEventListener(event, this.handleMediaEvent);
+                    media.addEventListener(event, this.mediaEvent);
                 });
                 this.mediaEventHandlersRegistered = true;
             }
 
             if (!this.session) {
-                let key = WebRTCsession.key(this._cardConfig);
-                this._cardSession = WebRTCsession.sessions.get(key);
-                if (!this._cardSession) {
-                    const configClone = JSON.parse(JSON.stringify(this._cardConfig));
-                    this._cardSession = WebRTCsession.create(configClone);
-                    WebRTCsession.sessions.set(key, this._cardSession);
-                }
+                const configClone = JSON.parse(JSON.stringify(this._cardConfig));
+                this._cardSession = WebRTCsession.getInstance(configClone);
             }
 
             const session = this.session;
-            session.attachCard(this, this.handleSessionEvent);
+            session.attachCard(this, this.sessionEvent);
 
             if (session.background && this.config.muted !== true)
                 this.unmuteMedia();
     
             this.loadRemoteStream();
             this.live(this.isPlaying);
-            this.renderVolume();
-            this.renderState();
-            this.renderMicrophone();
+            this.refreshVolume();
+            this.refreshState(true);
+            this.refreshMicrophone();
+
         }
         else if (allow_background && this.session?.background)
         {
@@ -2454,18 +2455,16 @@ class WebRTCbabycam extends HTMLElement {
 
             if (this.mediaEventHandlersRegistered) {
                 mediaEventTypes.forEach(event => {
-                    media.removeEventListener(event, this.handleMediaEvent);
+                    media.removeEventListener(event, this.mediaEvent);
                 });
                 this.mediaEventHandlersRegistered = false;
             }
 
-            this.session?.detachCard(this, this.handleSessionEvent);
+            this.session?.detachCard(this, this.sessionEvent);
             this._cardSession = null;
 
             this.setControlsVisibility(false);
             this.setPTZVisibility(false);
-
-            this.waitStartDate = null;
             this.unloadRemoteStream();
         }
     }
@@ -2507,7 +2506,7 @@ class WebRTCbabycam extends HTMLElement {
         return false;
     }
     
-    handleDocumentVisibility() {
+    documentVisibility() {
         if (document.hidden) {
             this.isVisibleInViewport = false;
         }
@@ -2518,7 +2517,7 @@ class WebRTCbabycam extends HTMLElement {
 
             this.isVisibleInViewport = this.isElementActuallyVisible(this);
         }
-        this.processVisibilityChange(this.isVisibleInViewport, this.session?.background);
+        this.applyVisibility(this.isVisibleInViewport, this.session?.background);
     }
 
     intersectionObserverCallback(entries) {
@@ -2527,7 +2526,7 @@ class WebRTCbabycam extends HTMLElement {
             this.isVisibleInViewport = isIntersecting
             if (document.fullscreenElement) return;
 
-            this.processVisibilityChange(this.isVisibleInViewport, this.session?.background);
+            this.applyVisibility(this.isVisibleInViewport, this.session?.background);
         }
     };
 
@@ -2565,7 +2564,7 @@ class WebRTCbabycam extends HTMLElement {
         }
 
         if (this.documentVisibilityListener) return;
-        document.addEventListener("visibilitychange", this.handleDocumentVisibility);
+        document.addEventListener("visibilitychange", this.documentVisibility);
         this.documentVisibilityListener = true;
     }
 
@@ -2578,7 +2577,7 @@ class WebRTCbabycam extends HTMLElement {
         this.resizeObserver = null;
 
         if (!this.documentVisibilityListener) return;
-        document.removeEventListener("visibilitychange", this.handleDocumentVisibility);
+        document.removeEventListener("visibilitychange", this.documentVisibility);
         this.documentVisibilityListener = false; 
     }
 
@@ -2598,9 +2597,8 @@ class WebRTCbabycam extends HTMLElement {
             this.attachShadow({ mode: 'open' });
         }
         
-        const config = this.config;
+        const { session, config } = this;
     
-        const hasVideo = config.video;
         const hasMove = config.ptz?.data_right;
         const hasZoom = config.ptz?.data_zoom_in;
         const hasHome = config.ptz?.data_home;
@@ -2609,11 +2607,11 @@ class WebRTCbabycam extends HTMLElement {
         const services = config.shortcuts?.services || config.shortcuts;
         const userCardStyle = config.style;
         
-        const background = config.background || this.session?.background;
+        const background = config.background || session?.background;
         const muted = config.audio === false || config.muted !== false || (background === true && config.muted !== true)
 
         if (!this.rendered) {
-            this.renderContainer(hasVideo, muted);
+            this.renderContainer(muted);
             this.renderPTZ(hasMove, hasZoom, hasHome, hasVol, hasMic);
             this.renderShortcuts(services);
             this.renderStyle(userCardStyle);
@@ -2644,14 +2642,14 @@ class WebRTCbabycam extends HTMLElement {
     disconnectedCallback() {
         this.removeVisibilityAndResizeHandlers();
         this.isVisibleInViewport = false;
-        this.processVisibilityChange(false, this.session?.background);
+        this.applyVisibility(false, this.session?.background);
     }
 
     loadRemoteStream() {
-        const media = this.media;
+        const { media } = this;
         const remoteStream = this.session?.activeCall?.remoteStream;
         
-        if (!media || !remoteStream) return;
+        if (!remoteStream) return;
 
         if (media.srcObject === remoteStream) {
             this.trace("Reloading remote media stream");
@@ -2668,13 +2666,12 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     unloadRemoteStream() {
-        const media = this.media;
-        if (media) {
-            media.removeAttribute('playing');
-            media.removeAttribute('loaded');
-            media.srcObject = null;
-            this.trace("Unloaded remote media");
-        }
+        const { media } = this;
+        media.removeAttribute('playing');
+        media.removeAttribute('playing-started');
+        media.removeAttribute('loaded');
+        media.srcObject = null;
+        this.trace("Unloaded remote media");
     }
 
     live(on) {
@@ -2738,11 +2735,10 @@ class WebRTCbabycam extends HTMLElement {
 
     unmuteMedia() {
         const media = this.media;
-        if (!media) return;
-
         if (media.muted) {
             if (WebRTCsession.unmuteEnabled) {
                 media.classList.remove('unmute-pending');
+                media.removeAttribute('muted');
                 media.muted = false;
             }
             else {
@@ -2750,29 +2746,23 @@ class WebRTCbabycam extends HTMLElement {
                 media.classList.add('unmute-pending');
             }
         }
-        this.renderState();
-        this.renderVolume();
+        this.refreshState();
+        this.refreshVolume();
     }
 
     muteMedia() {
-
-        const media = this.media;
-        if (!media) return;
-
+        const { media } = this;
         media.classList.remove('unmute-pending');
+        media.setAttribute('muted', '');
         media.muted = true;
-        this.renderState();
-        this.renderVolume();
+        this.refreshState();
+        this.refreshVolume();
     }
             
     toggleVolume() {
-
-        const media = this.media;
-        if (!media) return;
-
-        const session = this.session;
-        const allowBackground = session?.background || this.config?.allow_background || this.config?.background;
-        const allowMute = this.config?.allow_mute ?? true;
+        const { session, media, config } = this;
+        const allowBackground = session?.background || config?.allow_background || config?.background;
+        const allowMute = config?.allow_mute ?? true;
 
         if (session?.background) {
             this.trace("Exiting background mode");
@@ -2783,21 +2773,19 @@ class WebRTCbabycam extends HTMLElement {
                 this.muteMedia();
             }
             return;
-        }
-    
-        // not in background
+        } // not in background
+
         if (media.muted) {
             this.trace("Unmuting media");
             this.unmuteMedia();
             return;
-        }
-    
-        // no audio or unmuted
+        } // unmuted or no audio stream
+        
         if (session && allowBackground) {
             this.trace("Enabling background mode");
             session.background = true;
             return;
-        }
+        } // background mode not allowed
 
         if (allowMute) {
             this.trace("Muting media");
@@ -2806,21 +2794,18 @@ class WebRTCbabycam extends HTMLElement {
     }
     
     pauseMedia() {
-
-        const media = this.media;
-        if (!media) return;
+        const { media } = this;
         media.classList.add('pause-pending');
         media.pause();
     }
 
     playMedia(playMuted = undefined) {
 
-        const session = this.session;
-        if (!session || session.isTerminated) return;
- 
-        const media = this.media;
-
-        if (!media.srcObject) {
+        const { session, media } = this;
+        
+        if (!session || session.isTerminated) {
+            return;
+        } else if (!media.srcObject) {
             this.trace('Cannot play media without source stream');
             return;
         }
@@ -2835,11 +2820,6 @@ class WebRTCbabycam extends HTMLElement {
         else if (media.classList.contains('unmute-pending')) {
             mute = false;
         }
-        
-        if (mute && media.tagName == 'AUDIO') {
-            // do not attempt to play muted audio 
-            return;
-        }
 
         if (!mute && !WebRTCsession.unmuteEnabled)
         {
@@ -2851,22 +2831,19 @@ class WebRTCbabycam extends HTMLElement {
         if (media.muted != mute)
             media.muted = mute;
 
-        media.classList.add('pause-pending');
-
         this.trace(`Media play call muted=${media.muted}, unmuteEnabled=${WebRTCsession.unmuteEnabled}`);
- 
+       
         media.play()
             .then(_ => {
+                media.classList.remove('play-pending');
                 if (!media.muted) {
                     media.classList.remove('unmute-pending');
                     WebRTCsession.enableUnmute();
                 }
-                media.classList.remove('pause-pending');
             })
             .catch(err => {
-                media.classList.remove('pause-pending');
                 if (err.name == "NotAllowedError" && !media.muted && playMuted != true) {
-                    
+                    media.classList.add('play-pending');
                     media.classList.add('unmute-pending');
                     this.trace(`${err.message}`);
                     this.trace('Unmuted play failed');
@@ -2884,15 +2861,8 @@ class WebRTCbabycam extends HTMLElement {
             });
     }
 
-    createMedia(video, muted) {
-
-        let media;
-        if (video === false) {
-            media = document.createElement('audio');
-        } else {
-            media = document.createElement('video');
-        }
-
+    createMedia(muted) {
+        const media = document.createElement('video');
         media.className = 'media';
         media.setAttribute('playsinline', '');
         media.setAttribute('muted', '');
@@ -2909,16 +2879,17 @@ class WebRTCbabycam extends HTMLElement {
         return media;
     }
  
-    handleMediaEvent(ev) {
+    mediaEvent(ev) {
         
-        const session = this.session;
-        const media = this.media;
+        const { session, media } = this;
 
         this.trace(`MEDIA ${ev.type}`);
         switch (ev.type) {
             case 'emptied':
                 this.live(false);
                 media.removeAttribute('playing');
+                media.removeAttribute('playing-started');
+                media.removeAttribute('loaded');
                 break;
 
             case 'pause':
@@ -2926,32 +2897,26 @@ class WebRTCbabycam extends HTMLElement {
                 if (!session || session.isTerminated) return;
 
                 media.setAttribute('playing', 'paused');
-                this.renderState();
-                this.renderVolume();
+                this.refreshState();
+                this.refreshVolume();
         
                 if (media.classList.contains('pause-pending')) {
                     media.classList.remove('pause-pending');
+                    return;
+                }
+
+                if (media.classList.contains('play-pending')) {
                     return;
                 }
         
                 // Override default media element behavior: disable pause for live streams 
                 const shouldAllowPause = (media.controls && this.config.allow_pause);
         
-                if (media.tagName === 'AUDIO') {
-                    if (shouldAllowPause) {
-                        // Override default audio element behavior: mute on pause
-                        media.muted = true;
-                    }
-                    else if (media.muted === false) {
-                        this.trace('Unpausing audio');
-                        this.playMedia();
-                    }
-                    return;
-                }
-        
                 if (!shouldAllowPause) {
-                    this.trace('Unpausing video');
-                    this.playMedia();
+                    setTimeout(() => {
+                        this.trace('Unpausing video');
+                        this.playMedia();
+                    });
                 }
                 break;
 
@@ -2961,11 +2926,6 @@ class WebRTCbabycam extends HTMLElement {
                 break;
 
             case 'play':
-                if (this.config.muted === false && this.media.tagName === 'AUDIO') {
-                    // Override default audio element behavior: unmute on play
-                    this.unmuteMedia();
-                }
-                
                 clearTimeout(this.playTimeoutId);
                 this.playTimeoutId = setTimeout(() => {
                     
@@ -2976,24 +2936,28 @@ class WebRTCbabycam extends HTMLElement {
                             session?.restartCall();
                         }
 
-                }, WebRTCsession.TIMEOUT_RENDERING);
+                }, WebRTCsession.RENDERING_TIMEOUT_MS);
 
                 break;
 
             case 'playing':
                 if (!session || session.isTerminated) return;
 
-                clearTimeout(this.playTimeoutId);
+                clearTimeout(this.playTimeoutId); 
+                media.setAttribute('playing-started', Date.now());
 
-                if (media.tagName === 'AUDIO') {
+                const audioTracks = media.srcObject?.getAudioTracks()?.length ?? 0;
+                const videoTracks = media.srcObject?.getVideoTracks()?.length ?? 0;
+
+                if (!videoTracks) {
                     media.setAttribute('playing', 'audio');
                     this.live(true);
-                    this.renderState(); 
-                    this.renderVolume();
+                    this.refreshState(); 
+                    this.refreshVolume();
                     return;
                 }
 
-                if (session.isStreamingAudio)
+                if (audioTracks)
                     media.setAttribute('playing', 'audiovideo');
                 else
                     media.setAttribute('playing', 'video');
@@ -3008,29 +2972,18 @@ class WebRTCbabycam extends HTMLElement {
                 media.style.setProperty(`--video-aspect-ratio`, `${aspectRatio}`);
         
                 this.live(true);
-                this.renderState(); 
-                this.renderVolume();
+                this.refreshState(); 
+                this.refreshVolume();
                 break;
 
             case 'volumechange':
 
-                // todo: consider volumechange enableUnmute implementation
-                // if (media is playing && !media.muted && media.classList.contains('unmute-pending')) {
-                //     media.classList.remove('unmute-pending');
-                //     WebRTCsession.enableUnmute();
-                // }
-                
-                if (media.tagName === 'AUDIO') {
-                    // Override default audio element behavior: mute controls play/pause
-                    if (media.muted)
-                        this.pauseMedia();
-                    else
-                        this.playMedia();
-        
-                    if (this.media.controls)
-                        this.setControlsVisibility(true);
+                if (media.muted) { 
+                    media.setAttribute('muted');
+                } else {
+                    media.removeAttribute('muted');
                 }
-                this.renderVolume();
+                this.refreshVolume();
                 break;
 
             case 'dblclick':
