@@ -47,8 +47,35 @@ resources:
 
 ```
  
+## Configuration
 
-## Usage
+| **Name** | **Type** | **Default** | **Supported Options** | **Description** |
+|----------|----------|-------------|----------------------|----------------|
+| **entity** | `string` | **Required** | Camera entity ID, e.g. `camera.front_door` | The Home Assistant camera entity to use. Used for `entity_picture` (fallback) or passing along an identifier to the signaling server. |
+| **url** | `string` | **Required** | Any valid HTTP(s) or WebSocket URL | Base or direct URL for the WebRTC signaling or camera feed, e.g., `go2rtc` or `RTSPtoWeb` server URL. |
+| **url_type** | `string` | `"webrtc-babycam"` | `"webrtc-babycam"`, `"go2rtc"`, `"webrtc-camera"`, `"whep"`, `"rtsptoweb"` | Determines which signaling approach/class is used. |
+| **video** | `boolean` | `true` | `true`, `false` | Enable (receive) video track. If `false`, video is disabled (audio-only or still images). |
+| **audio** | `boolean` | `true` | `true`, `false` | Enable (receive) audio track. If `false`, audio is disabled entirely. |
+| **muted** | `boolean` | `true` | `true`, `false` | Mute the player element on load. If `false`, the player attempts to play with audio enabled, but browsers often require user interaction to unmute. |
+| **microphone** | `boolean` | `false` | `true`, `false` | Enable *two-way audio* from the user’s microphone to the camera feed if the browser permits. |
+| **background** | `boolean` | `false` | `true`, `false` | If `true`, enables "background mode," where the audio continues to play when off-screen. |
+| **fullscreen** | `string` | (optional)  | `"video"`, `null` | Controls whether entering fullscreen enables video. `"video"` automatically enables video when fullscreen. |
+| **debug** | `boolean` | `false` | `true`, `false` | Enables verbose logging. Shows a translucent debug panel capturing debug/tracing messages. |
+| **stats** | `boolean` | `false` | `true`, `false` | Enables measurement and display of streaming stats (e.g., framerate, bandwidth). |
+| **allow_background** | `boolean` | `false` | `true`, `false` | If `true`, allows toggling the “pin” icon to enable background mode. |
+| **allow_mute** | `boolean` | `true` | `true`, `false` | If `false`, prevents toggling the mute/unmute icon in the UI. |
+| **allow_pause** | `boolean` | `false` | `true`, `false` | If `true`, allows pausing/resuming the stream with a pause icon. |
+| **allow_microphone** | `boolean` | `false` | `true`, `false` | If `true`, the user can turn on/off the microphone during the session for two-way audio. |
+| **fps** | `number` | (optional) | Any numeric FPS value | A numeric hint for frames per second (FPS) used to estimate "render quality" in stats. If `null`, auto-detects FPS. |
+| **image_url** | `string` | (optional)  | Any valid image URL | Custom URL for still snapshots when video is not playing. |
+| **image_interval** | `number` | `3000` (default) | Any numeric value in milliseconds | Interval (in ms) for fetching a new still image when video is not playing. |
+| **image_expiry** | `number` | `15000` (default) | Any numeric value in milliseconds | Time (in ms) before an image is considered expired or blurred. |
+| **ptz** | `object` | (optional)  | PTZ service call object | Specifies *Pan/Tilt/Zoom* service calls. Example: `{ service: 'camera.ptz', data_up: {...} }`. |
+| **style** | `string` | (optional)  | CSS string | Custom CSS block injected into the card’s Shadow DOM (e.g., for styling icons or layout). |
+| **shortcuts** | `object` | (optional)  | Service shortcut object or array | Object/array of shortcut buttons that run HA services when clicked. Example: `{ services: [ { icon: 'mdi:lightbulb', service: 'light.turn_on' } ] }`. |
+
+
+### Usage
 
 Create a card in Lovelace:
 
@@ -59,14 +86,12 @@ url: "http://your_webrtc_endpoint"
 audio: true
 video: true
 unmuted: true
-stats: false
-debug: false
 microphone: false
 allow_background: true
 ```
 
 
-## PTZ & Shortcuts (Optional)
+### PTZ & Shortcuts (Optional)
 
 ```yaml
 ptz:
@@ -81,7 +106,6 @@ shortcuts:
     service_data:
       entity_id: light.nursery
 ```
-
 
 ## Keyboard Shortcuts
 
