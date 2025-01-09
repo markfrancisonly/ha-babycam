@@ -31,7 +31,7 @@ class WebRTCsession {
     static IMAGE_FETCH_TIMEOUT_MS = 10000;
     static IMAGE_FETCH_INTERVAL_MS = 3000;
     static IMAGE_EXPIRY_MS = 30000;
-    static IMAGE_EXPIRY_RETRIES = 10;
+    static IMAGE_EXPIRY_RETRIES = 5;
     static SESSION_TERMINATION_DELAY_MS = WebRTCsession.IMAGE_FETCH_INTERVAL_MS;
 
     constructor(key, hass, config) {
@@ -1392,12 +1392,12 @@ class WebRTCbabycam extends HTMLElement {
                     filter: none;
                     opacity: 1;
                 }
-                99% {
+                90% {
                     filter: none;
                     opacity: 1;
                 }
                 100% {
-                    filter: blur(5px);
+                    filter: blur(3px);
                     opacity: 0.5;
                 }
             }
@@ -1415,7 +1415,7 @@ class WebRTCbabycam extends HTMLElement {
             }
             .image[size]:not([timestamp]) {
                 display: block;
-                filter: blur(5px) !important;
+                filter: blur(3px) !important;
                 opacity: 0.5 !important;
                 animation: none;
             }
@@ -2390,7 +2390,6 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     setConfig(config) { 
-
         if (!('RTCPeerConnection' in window) && (config.video !== false || config.audio !== false)) {
             throw new Error("Browser does not support WebRTC");
         }
@@ -2400,7 +2399,6 @@ class WebRTCbabycam extends HTMLElement {
         if (config.ptz && !config.ptz.service) {
             throw new Error("Missing `service` for `ptz`");
         }
-      
 
         const defaultConfig = {
             "entity": null,
@@ -2419,6 +2417,7 @@ class WebRTCbabycam extends HTMLElement {
             "allow_background": false,
             "allow_mute": true,
             "allow_pause": false,
+            "allow_microphone": false,
             "fps": null,
             "ptz": null,
             "style": null,
