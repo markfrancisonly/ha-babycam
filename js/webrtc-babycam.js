@@ -38,10 +38,13 @@ class WebRTCsession {
         if (!config || !config.entity) {
             throw new Error("Entity configuration is required but entity needn't exist");
         }
-
+        
         this.key = key;
         this.hass = hass;
         this.config = config;
+        
+        const salt = (crypto?.randomUUID?.() || String(Math.random())).substring(0,6)
+        this.id = `${this.key}_${salt}`;
 
         this.state = {
             cards: new Set(),
@@ -72,7 +75,10 @@ class WebRTCsession {
     }
 
     static get sessions() { 
-        return window.webrtcSessions;
+        const root = (window.top ?? window);          // survive iframes
+        const sym = (root.__webrtcSessionsSym ||= Symbol.for('webrtc-babycam:sessions'));
+        if (!root[sym]) root[sym] = new Map();
+        return root[sym];
     }
 
     static key(config) {
@@ -92,7 +98,7 @@ class WebRTCsession {
         if (!session) {
             session = new WebRTCsession(key, hass, config);
             WebRTCsession.sessions.set(key, session);
-            console.debug(`****** created session ${key} #${WebRTCsession.sessions.size}`);
+            console.debug(`****** created session ${session.id} #${WebRTCsession.sessions.size}`);
         }
         return session; 
     }
@@ -603,13 +609,14 @@ class WebRTCsession {
     }
 
     _trace(message, o) {
-        const call = this.activeCall;
-        const callStarted = call?.startDate;
         const now = Date.now();
+
+        const call = this.activeCall;
+        const callId = call?.id ?? 'nocall';
+        const callStarted = call?.startDate;
+        const timestamp = callStarted ? (now - callStarted).toString().padStart(9, '0') : (new Date).getTime();
         
-        const timestamp = callStarted ? (now - callStarted) : (new Date).getTime();
-        const id = call?.id ?? this.key;
-        const text = `${id}:${timestamp}: ${message}`;
+        const text = `${this.id} | ${callId} | ${timestamp}: ${message}`;
         if (o)
             console.debug(text, o);
         else
@@ -693,6 +700,8 @@ class WebRTCsession {
     
         return audioTracks.some(track => track.readyState === 'live');
     }
+    
+    latestCallId = null;
 
     async startCall() {
         const { config } = this;
@@ -707,12 +716,10 @@ class WebRTCsession {
         }
 
         const now = Date.now();
-        const seconds = Math.floor((now / 1000) % 60);
-        const minutes = Math.floor((now / 60000) % 60);
-        const salt = `${minutes.toString().padStart(2, '0')}${seconds.toString().padStart(2, '0')}`;
+        const salt = (crypto?.randomUUID?.() || String(Math.random())).substring(0,6)
 
         const call = {
-            id: `${this.key}_${salt}`,
+            id: `call-${salt}`,
             startDate: now,
             reconnectDate: 0,
             signalingChannel: null,
@@ -720,8 +727,8 @@ class WebRTCsession {
             localStream: null,
             remoteStream: null
         };
-
         this.state.calls.set(call.id, call);
+        this.latestCallId = call.id;
 
         try {
             this.trace(`Call started`);
@@ -790,6 +797,8 @@ class WebRTCsession {
             try {
                 const offer = await call.peerConnection.createOffer({
                     voiceActivityDetection: false,
+                    offerToReceiveAudio: (config.audio === true),
+                    offerToReceiveVideo: (config.video === true),
                     iceRestart: true
                 });
                 this.trace('Offer created.');
@@ -874,6 +883,7 @@ class WebRTCsession {
 
         this.trace('Call ended');
         this.timeoutCall(call);
+        this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: null } }));
         this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: false} }));        
     }
 
@@ -890,6 +900,9 @@ class WebRTCsession {
         const pc = new RTCPeerConnection(rtcConfig);
 
         pc.oniceconnectionstatechange = () => {
+            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
+            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
             this.trace(`ICE state: ${pc.iceConnectionState}`);
 
             const iceState = pc.iceConnectionState;
@@ -910,6 +923,9 @@ class WebRTCsession {
         };
 
         pc.onicecandidate = ev => {
+            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
+            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
             if (!call.signalingChannel?.isOpen) {
                 this.trace(`Signaling channel closed, cannot send ICE '${ev?.candidate?.candidate}'`);
                 return;
@@ -925,6 +941,9 @@ class WebRTCsession {
         };
 
         pc.ontrack = ev => {
+            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
+            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
             const track = ev.track;
             this.trace(`Received ${track.kind} track ${track.id}`);
 
@@ -943,6 +962,9 @@ class WebRTCsession {
         };
 
         pc.onremovestream = (ev) => {
+            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
+            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
             this.trace('Remote stream removed');
             call.remoteStream = null;
             this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: call.remoteStream } }));
@@ -1022,6 +1044,9 @@ class WebRTCsession {
 
         try {
             signalingChannel.oncandidate = (candidate) => {
+                const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
+                if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
                 if (candidate) {
                     this.trace(`Received ICE candidate '${candidate.candidate}'`);
                 } else {
@@ -1037,7 +1062,11 @@ class WebRTCsession {
             };
 
             signalingChannel.onanswer = async (answer) => {
+                const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
+                if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
                 this.trace("Received answer");
+
                 try {
                     await call.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
                     this.trace(`Remote description set`);
@@ -1049,6 +1078,9 @@ class WebRTCsession {
             };
 
             signalingChannel.onerror = (err) => {
+                const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
+                if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
                 this.trace(`Signaling error: ${err.message}`);
                 this.lastError = err.message;
                 this.trace(this.lastError);
@@ -1215,7 +1247,9 @@ class WebRTCbabycam extends HTMLElement {
         super();
 
         WebRTCbabycam.instanceCount += 1;
-        this.instanceId = WebRTCbabycam.instanceCount;
+
+        const salt = (crypto?.randomUUID?.() || String(Math.random())).substring(0,6)
+        this.instanceId = `${salt}-${WebRTCbabycam.instanceCount}`;
 
         this.rendered = false;
         this.playingWaitStartDate = null;
@@ -1224,7 +1258,7 @@ class WebRTCbabycam extends HTMLElement {
         this._cardConfig = null;
         this._cardMedia = null;
         this._cardSession = null;
-        
+
         this.resizeObserver = null;
         this.intersectionObserver = null;
         this.intersectionObserverCallback = this.intersectionObserverCallback.bind(this);
@@ -1233,6 +1267,8 @@ class WebRTCbabycam extends HTMLElement {
         this.sessionEvent = this.sessionEvent.bind(this); 
         this.mediaEvent = this.mediaEvent.bind(this); 
 
+        this.playPromise = null;
+        this.playGen = 0; 
         this.playTimeoutId = undefined;
         this.imageRefreshTimeoutId = undefined;
     }
@@ -2331,7 +2367,7 @@ class WebRTCbabycam extends HTMLElement {
         if (session?.tracing === false)
             return;
 
-        text = `${this.instanceId} ${text}`;
+        text = `${this.instanceId} | ${text}`;
         if (session)  {
             session.trace(text, o);
         }
@@ -2356,7 +2392,7 @@ class WebRTCbabycam extends HTMLElement {
         const max_entries = 1000;
         const min_entries = 500;
 
-        log.insertAdjacentHTML('beforeend', `${this.instanceId} ${message.replace("\n", "<br>")}<br>`);
+        log.insertAdjacentHTML('beforeend', `${this.instanceId} | ${message.replace("\n", "<br>")}<br>`);
         if (log.childNodes.length > max_entries) {
             while (log.childNodes.length > min_entries) {
                 log.removeChild(log.firstChild);
@@ -2438,6 +2474,11 @@ class WebRTCbabycam extends HTMLElement {
             return;
         }
         this._cardConfig = mergedConfig;
+
+        if (this.isConnected) {
+            // reuse the same init path as normal attach
+            this.connectedCallback();
+        }
     }
 
     set hass(hass) {
@@ -2462,6 +2503,7 @@ class WebRTCbabycam extends HTMLElement {
             'canplay',
             'play',
             'playing',
+            'loadedmetadata',
             'volumechange',
             'dblclick',
             'click',
@@ -2500,9 +2542,11 @@ class WebRTCbabycam extends HTMLElement {
         }
         else if (allow_background && this.session?.background)
         {
+            this.trace(`Keeping one background card`);
             this.releaseOtherBackgroundCards();
         }
         else {
+            this.trace(`Detaching card from session`);
 
             if (this.mediaEventHandlersRegistered) {
                 mediaEventTypes.forEach(event => {
@@ -2510,7 +2554,7 @@ class WebRTCbabycam extends HTMLElement {
                 });
                 this.mediaEventHandlersRegistered = false;
             }
-
+            
             this.session?.detachCard(this, this.sessionEvent);
             this._cardSession = null;
 
@@ -2674,6 +2718,9 @@ class WebRTCbabycam extends HTMLElement {
     connectedCallback() {
         WebRTCbabycam.globalInit();
 
+        // If we were attached before configuration, wait until config to exist
+         if (!this._cardConfig) return;
+
         if (this.session?.state?.cards?.has(this)) {
             // card running in the background
             this.setupVisibilityAndResizeHandlers();
@@ -2698,22 +2745,24 @@ class WebRTCbabycam extends HTMLElement {
 
     loadRemoteStream() {
         const { media } = this;
-        const remoteStream = this.session?.activeCall?.remoteStream;
-        
-        if (!remoteStream) return;
 
-        if (media.srcObject === remoteStream) {
-            this.trace("Reloading remote media stream");
-        }
-        else {
+        const remoteStream = this.session?.activeCall?.remoteStream;
+        if (!remoteStream) return;
+        const same = media.srcObject === remoteStream;
+
+        if (same) {
+            this.trace("Ignoring request to reload media stream");
+        } else {
             this.trace("Loading remote media stream");
-            media.setAttribute('loaded', Date.now());
+            this.playGen++;
             media.srcObject = remoteStream;
+            media.setAttribute('loaded', Date.now());
         }
 
         if (this.session?.isStreaming && !this.isPlaying) {
-            this.playMedia();
+           this.playMedia();
         }
+      
     }
 
     unloadRemoteStream() {
@@ -2849,16 +2898,23 @@ class WebRTCbabycam extends HTMLElement {
         media.classList.add('pause-pending');
         media.pause();
     }
-
+ 
     playMedia(playMuted = undefined) {
 
         const { session, media } = this;
         
         if (!session || session.isTerminated) {
+            this.trace('Cannot play media from terminated session');
             return;
         } else if (!media.srcObject) {
             this.trace('Cannot play media without source stream');
             return;
+        }
+
+        if (this.playPromise) 
+        {
+            this.trace('Overlapping play media request ignored');
+            return this.playPromise; // don't overlap
         }
 
         let mute = media.muted;
@@ -2882,10 +2938,14 @@ class WebRTCbabycam extends HTMLElement {
         if (media.muted != mute)
             media.muted = mute;
 
-        this.trace(`Media play call muted=${media.muted}, unmuteEnabled=${WebRTCsession.unmuteEnabled}`);
+        // Capture generation so late resolves don't touch current state
+        const myGen = this.playGen;
+
+        this.trace(`Media play call muted=${media.muted}, unmuteEnabled=${WebRTCsession.unmuteEnabled}, gen=${myGen}`);
        
-        media.play()
+        this.playPromise = media.play()
             .then(_ => {
+                if (myGen !== this.playGen) return;
                 media.classList.remove('play-pending');
                 if (!media.muted) {
                     media.classList.remove('unmute-pending');
@@ -2893,6 +2953,11 @@ class WebRTCbabycam extends HTMLElement {
                 }
             })
             .catch(err => {
+                if (myGen !== this.playGen) return; // ignore aborts from a replaced stream
+                if (err.name === "AbortError") {
+                    this.trace(`Media play aborted: ${err.message}`);
+                    return;
+                }
                 if (err.name == "NotAllowedError" && !media.muted && playMuted != true) {
                     media.classList.add('play-pending');
                     media.classList.add('unmute-pending');
@@ -2900,15 +2965,13 @@ class WebRTCbabycam extends HTMLElement {
                     this.trace('Unmuted play failed');
 
                     WebRTCsession.enableUnmute(false);
-                    
+                    return;
                     // retrying here often fails, so we need to wait for user interaction
                 }
-                else if (err.name === "AbortError") {
-                    this.trace(`Media play aborted: ${err.message}`);
-                }
-                else {
-                    this.trace(`Media play failed: ${err.message}`);
-                }
+                this.trace(`Media play failed: ${err.message}`);
+            })
+            .finally(() => {
+                if (myGen === this.playGen) this.playPromise = null;
             });
     }
 
@@ -2916,7 +2979,9 @@ class WebRTCbabycam extends HTMLElement {
         const media = document.createElement('video');
         media.className = 'media';
         media.setAttribute('playsinline', '');
+        media.setAttribute('autoplay','');
         media.setAttribute('muted', '');
+        media.defaultMuted = true;
         media.muted = true;
         media.playsinline = true;
         media.controls = false;
@@ -2969,6 +3034,10 @@ class WebRTCbabycam extends HTMLElement {
                         this.playMedia();
                     });
                 }
+                break;
+
+            case 'loadedmetadata':
+                this.trace('Loaded metadata');
                 break;
 
             case 'canplay':
