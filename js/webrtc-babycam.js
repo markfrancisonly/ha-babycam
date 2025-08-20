@@ -793,36 +793,6 @@ class WebRTCsession {
             return null;
         }
 
-        (async () => {
-            try {
-                const offer = await call.peerConnection.createOffer({
-                    voiceActivityDetection: false,
-                    offerToReceiveAudio: (config.audio === true),
-                    offerToReceiveVideo: (config.video === true),
-                    iceRestart: true
-                });
-                this.trace('Offer created.');
-        
-                await call.peerConnection.setLocalDescription(offer);
-                this.trace('Local description set successfully.');
-        
-                if (call.signalingChannel) {
-                    this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
-                    await call.signalingChannel.sendOffer(offer);
-                    this.trace('Offer sent via signaling channel.');
-                } 
-                else {
-                    throw new Error('Signaling channel is not available.');
-                }
-            } catch (err) {
-                this.lastError = `Error negotiating WebRTC call. ${err.name}: ${err.message}`;
-                this.trace(this.lastError);
-                this.setStatus('error');
-
-                await this.endCall(call);
-            }
-        })();
-
         return call;
     }
     
@@ -913,24 +883,35 @@ class WebRTCsession {
             }
 
             try {
+                call.makingOffer = true;
                 const offerOptions = {
                     voiceActivityDetection: false,
                     offerToReceiveAudio: (config.audio === true),
                     offerToReceiveVideo: (config.video === true),
                     iceRestart: true
                 };
-                const offer = await pc.createOffer(offerOptions);
-                await pc.setLocalDescription(offer);
+                const offer = await pc.createOffer(offerOptions); 
+                this.trace('Offer created.');
+
+                await pc.setLocalDescription(offer); 
                 this.trace('Local description set successfully.');
 
-                this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
-                await call.signalingChannel.sendOffer(offer);
-                this.trace('Offer sent via signaling channel.');
+                 if (call.signalingChannel) {
+                    this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
+                    await call.signalingChannel.sendOffer(offer);
+                    this.trace('Offer sent via signaling channel.');
+                } 
+                else {
+                    throw new Error('Signaling channel is not available.');
+                }
+
             } catch (err) {
                 this.lastError = `Error negotiating WebRTC call. ${err.name}: ${err.message}`;
                 this.trace(this.lastError);
                 this.setStatus('error');
-                this.restartCall(call); 
+                this.restartCall(call); // Ensure restart on failure
+            } finally {
+                call.makingOffer = false;
             }
         };
         
