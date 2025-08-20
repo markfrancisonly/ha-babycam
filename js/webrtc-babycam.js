@@ -896,35 +896,66 @@ class WebRTCsession {
             call.peerConnection = null;
         }
 
+        const isStale = () => call.id !== this.latestCallId || !this.state.calls.has(call.id);
+
         const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
         const pc = new RTCPeerConnection(rtcConfig);
 
-        pc.oniceconnectionstatechange = () => {
-            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
-            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+        pc.onnegotiationneeded = async () => {
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
 
-            this.trace(`ICE state: ${pc.iceConnectionState}`);
+            this.trace('Negotiation needed');
 
-            const iceState = pc.iceConnectionState;
-            switch (iceState) {
-                case "completed":
+            if (!call.signalingChannel || !call.signalingChannel.isOpen) {
+                this.trace('Signaling channel unavailable for renegotiation; restarting call');
+                this.restartCall(call);
+                return;
+            }
+
+            try {
+                const offerOptions = {
+                    voiceActivityDetection: false,
+                    offerToReceiveAudio: (config.audio === true),
+                    offerToReceiveVideo: (config.video === true),
+                    iceRestart: true
+                };
+                const offer = await pc.createOffer(offerOptions);
+                await pc.setLocalDescription(offer);
+                this.trace('Local description set successfully.');
+
+                this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
+                await call.signalingChannel.sendOffer(offer);
+                this.trace('Offer sent via signaling channel.');
+            } catch (err) {
+                this.lastError = `Error negotiating WebRTC call. ${err.name}: ${err.message}`;
+                this.trace(this.lastError);
+                this.setStatus('error');
+                this.restartCall(call); 
+            }
+        };
+        
+        pc.onconnectionstatechange = () => {
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+
+            const connectionState = pc.connectionState;
+            this.trace(`Connection state: ${connectionState}`);
+
+            switch (connectionState) {
                 case "connected":
                     this.setStatus('connected');
                     this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: true} }));
                     this.extendCallTimeout(call, WebRTCsession.RENDERING_TIMEOUT_MS);
                     break;
-
+                case "disconnected":
                 case "failed":
                 case "closed":
-                case "disconnected":
                     this.restartCall(call);
                     break;
             }
         };
 
         pc.onicecandidate = ev => {
-            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
-            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
 
             if (!call.signalingChannel?.isOpen) {
                 this.trace(`Signaling channel closed, cannot send ICE '${ev?.candidate?.candidate}'`);
@@ -941,8 +972,7 @@ class WebRTCsession {
         };
 
         pc.ontrack = ev => {
-            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
-            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
 
             const track = ev.track;
             this.trace(`Received ${track.kind} track ${track.id}`);
@@ -962,8 +992,7 @@ class WebRTCsession {
         };
 
         pc.onremovestream = (ev) => {
-            const isStale = call.id !== this.latestCallId || !this.state.calls.has(call.id);
-            if (isStale) { this.trace('Overlapping session event ignored'); return; }
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
 
             this.trace('Remote stream removed');
             call.remoteStream = null;
