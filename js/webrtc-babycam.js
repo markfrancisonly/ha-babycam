@@ -1390,6 +1390,7 @@ class WebRTCbabycam extends HTMLElement {
                 position: relative;
                 border-radius: 0px;
                 border-style: none;
+                isolation: isolate;
             }
             .media-container {
                 background: var(--primary-background-color);
@@ -3635,4 +3636,5 @@ class RTSPtoWebSignalingChannel extends SignalingChannel {
             this.httpTimeoutId = undefined;
         }
     }
+
 }
