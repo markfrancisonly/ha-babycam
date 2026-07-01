@@ -38,14 +38,19 @@ Additionally, background audio features allow you to monitor your baby on your i
 ## Installation
 
 1. Copy `webrtc-babycam.js` into your `www` folder.
-2. Add it as a resource in your Lovelace dashboard:
+2. Add it as a resource in your Lovelace dashboard, with a cache-busting version query:
 
 ```yaml
 resources:
-- url: /local/webrtc-babycam.js
+- url: /local/webrtc-babycam.js?v=2026.7.1
   type: module
 
 ```
+
+Browsers (especially wall tablets) cache card code aggressively — bump the `?v=` value
+whenever you update the file. To confirm which version is actually running, check the
+browser console banner, or enable the debug overlay (`Shift+D` or `?debug`) on any card:
+the first log line shows the loaded version.
  
 ## Configuration
 
@@ -63,10 +68,16 @@ resources:
 | **debug** | `boolean` | `false` | `true`, `false` | Enables verbose logging. Shows a translucent debug panel capturing debug/tracing messages. |
 | **stats** | `boolean` | `false` | `true`, `false` | Enables measurement and display of streaming stats (e.g., framerate, bandwidth). |
 | **allow_background** | `boolean` | `false` | `true`, `false` | If `true`, allows toggling the “pin” icon to enable background mode. |
+| **background_muted_grace** | `number` | `60000` | Milliseconds | How long a hidden background stream may stay autoplay-muted before it is parked (stopped, resumable from the dock). |
+| **background_mute_policy** | `string` | `"park"` | `"park"`, `"keep"` | `"keep"` preserves the old behavior of streaming muted audio forever while hidden. |
+| **background_video** | `string` | `"shed"` | `"shed"`, `"keep"` | `"shed"` renegotiates background calls audio-only while no card is visible (video restored on return); auto-falls back to `"keep"` if the source rejects audio-only offers. |
+| **background_timeout** | `number` | `0` | Minutes (`0` = off) | Optional TTL: parks a background stream this long after the last user interaction (never silently — the dock shows it as paused and one tap resumes). |
+| **dock** | `boolean` | `true` | `true`, `false` | `false` hides this camera from the minimized background dock (e.g. kiosk setups). |
 | **allow_mute** | `boolean` | `true` | `true`, `false` | If `false`, prevents toggling the mute/unmute icon in the UI. |
 | **allow_pause** | `boolean` | `false` | `true`, `false` | If `true`, allows pausing/resuming the stream with a pause icon. |
 | **allow_microphone** | `boolean` | `false` | `true`, `false` | If `true`, the user can turn on/off the microphone during the session for two-way audio. |
 | **fps** | `number` | (optional) | Any numeric FPS value | A numeric hint for frames per second (FPS) used to estimate "render quality" in stats. If `null`, auto-detects FPS. |
+| **ice_servers** | `array` | (optional) | Array of `RTCIceServer` objects, or `[]` | Replaces the built-in Google STUN default. Use `[]` on LAN-only setups (host candidates suffice; nothing contacts Google), or supply your own STUN/TURN servers for remote access. |
 | **image_url** | `string` | (optional)  | Any valid image URL | Custom URL for still snapshots when video is not playing. |
 | **image_interval** | `number` | `3000` (default) | Any numeric value in milliseconds | Interval (in ms) for fetching a new still image when video is not playing. |
 | **image_expiry** | `number` | `15000` (default) | Any numeric value in milliseconds | Time (in ms) before an image is considered expired or blurred. |
@@ -107,9 +118,26 @@ shortcuts:
       entity_id: light.nursery
 ```
 
+## Background mode & the dock
+
+Pinning a card (the pin step in the volume-icon cycle) keeps its audio streaming when the
+card leaves the screen. While a background stream is active and its card is not visible, a
+small **dock** pill appears bottom-center on the dashboard. Tapping it lists each background
+camera with its live state and two actions: **return** (navigate back to the camera's view)
+and **close** (stop the background stream, with a 5-second UNDO). If background audio was
+blocked by the browser's autoplay policy, the row says so — tapping it is the unmute gesture.
+After a reload, pinned cameras show as *suspended* chips; one tap reopens them.
+
+Background sessions are coordinated across tabs (only one tab streams a hidden camera),
+survive page lifecycle events (bfcache, tab freeze), shed video while nothing renders it,
+and park themselves — visibly, never silently — when audio cannot be heard. See
+[docs/background-mode.md](docs/background-mode.md) for the full design.
+
 ## Keyboard Shortcuts
 
 -  **Shift+T**: Toggle global mute
 -  **Shift+D**: Toggle debug output
 -  **Shift+S**: Toggle stats panel 
+
+Shortcuts are ignored while typing in input fields.
  

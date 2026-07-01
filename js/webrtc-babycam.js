@@ -1,11 +1,57 @@
+// Bump on every release: stale cached card code is the most common cause of "it still
+// misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
+// the dock tooltip all surface this value so a fresh load is a one-glance check.
+const CARD_VERSION = '2026.7.1';
+
 console.info(
-    `%c  WebRTC Babycam \n%c`,
+    `%c  WebRTC Babycam %c v${CARD_VERSION} `,
     'color: orange; font-weight: bold; background: black',
     'color: white; font-weight: bold; background: dimgray',
 );
 
 const noop = () => {};
-window.webrtcSessions = window.webrtcSessions ?? new Map();
+
+// Resolve the cross-document root once: reading or writing properties on a cross-origin
+// window.top throws SecurityError (HTML spec CrossOriginPropertyFallback), which would
+// otherwise break every card operation when HA is embedded in a cross-origin iframe.
+const topWindow = (() => {
+    try {
+        if (window.top && window.top.document) return window.top;
+    } catch { }
+    return window;
+})();
+
+// crypto.randomUUID is secure-context-only (HA commonly runs on plain http); the old
+// String(Math.random()).substring(0,6) fallback produced '0.####' - only ~10k distinct
+// salts, making call-id collisions routine under unbounded reconnect. getRandomValues is
+// NOT secure-context-gated and is the correct insecure-context CSPRNG.
+const randomSalt = () => {
+    try {
+        if (typeof crypto?.randomUUID === 'function') return crypto.randomUUID().substring(0, 8);
+        if (typeof crypto?.getRandomValues === 'function') {
+            return Array.from(crypto.getRandomValues(new Uint8Array(4)), b => b.toString(16).padStart(2, '0')).join('');
+        }
+    } catch { }
+    return String(Math.random()).substring(2, 10);
+};
+
+// localStorage can throw on access (storage denied, private mode, sandboxed iframe);
+// a throw inside the background getter would prevent card attach entirely.
+const safeStorage = {
+    get(key) { try { return localStorage.getItem(key); } catch { return null; } },
+    set(key, value) { try { localStorage.setItem(key, value); return true; } catch { return false; } },
+    remove(key) { try { localStorage.removeItem(key); } catch { } },
+    keys(pattern) {
+        const result = [];
+        try {
+            for (let i = 0; i < localStorage.length; i++) {
+                const k = localStorage.key(i);
+                if (k && pattern.test(k)) result.push(k);
+            }
+        } catch { }
+        return result;
+    }
+};
 
 /**
  * WebRTC Babycam Custom Element
@@ -13,6 +59,14 @@ window.webrtcSessions = window.webrtcSessions ?? new Map();
  */
 class WebRTCsession {
     static unmuteEnabled = undefined;
+    static globalMute = false;
+    static VIDEO_DEFER_BASE_MS = 2000;
+    static VIDEO_DEFER_MAX_MS = 30000;
+    static VIDEO_FRAME_POLL_INTERVAL_MS = 1000;
+    static LIVE_INDICATOR_TIMEOUT_MS = 3000;
+    static MEDIA_STALE_GRACE_MS = 2000;
+    static TICK_STARVATION_MS = 5000;
+    static BACKGROUND_MUTED_GRACE_MS = 60000;
 
     static globalDebug = (() => {
         const value = (new URLSearchParams(window.location.search)).get('debug');
@@ -38,10 +92,12 @@ class WebRTCsession {
         if (!config || !config.entity) {
             throw new Error("Entity configuration is required but entity needn't exist");
         }
-
+        
         this.key = key;
         this.hass = hass;
         this.config = config;
+        
+        this.id = `${this.key}_${randomSalt()}`;
 
         this.state = {
             cards: new Set(),
@@ -49,52 +105,105 @@ class WebRTCsession {
             statistics: "",
             status: 'uninitialized',
             calls: new Map(),
-            activeCall: null
+            activeCall: null,
+            backgroundCard: null
         };
 
         this.lastError = null;
         this.eventTarget = new EventTarget();
-        this.fetchImageTimeoutId = undefined;
+        this.fetchImageInFlight = false;
+        this.fetchAbortController = null;
         this.imageLoopTimeoutId = undefined;
         this.watchdogTimeoutId = undefined;
         this.terminationTimeoutId = undefined;
+        this.playRunning = false;
+        this.imageLoopPhase = undefined;
+        this.videoDeferredUntil = 0;
+        this.videoPressure = 0;
+        this.lastInterestDate = Date.now();
+        this.lastTickDate = 0;
+        this.parked = null;                  // background park reason: 'muted' | 'expired' | 'user' | null
+        this.mutedBackgroundSince = null;
+        this.audioOnlyFailures = 0;          // consecutive failed audio-only (video-shed) calls
+        this.ownerWindow = window;           // realm liveness check for the shared registry
 
         this.trace = noop;
         this.resetStats();
 
-        if (this.config.background === true && this.background === false)
-            this.background = true;
-
-        if (this.config.microphone === true && this.microphone === false)
-            this.microphone = true;
-
         this.determineUnmuteEnabled();
     }
 
-    static get sessions() { 
-        return window.webrtcSessions;
+    static get sessions() {
+        const root = topWindow;                       // survive same-origin iframes; cross-origin-safe
+        const sym = (root.__webrtcSessionsSym ||= Symbol.for('webrtc-babycam:sessions'));
+        if (!root[sym]) root[sym] = new Map();
+        return root[sym];
     }
+
+    static isSessionAlive(session) {
+        // A session created by a destroyed document (same-origin iframe navigated away)
+        // schedules timers in a dead realm that never fire; discard it rather than let a
+        // card attach to a permanently inert session.
+        try { return !!session.ownerWindow?.document?.defaultView; } catch { return false; }
+    }
+
+    static requestStreamBudgetRebalance() {}
+    static rebalanceStreamBudget() {}
 
     static key(config) {
         let key = config.entity.replace(/[^a-z0-9A-Z_-]/g, '-');
 
-        // todo: move defaults out of constructor
         if (config.audio === false) key += '-a';
         if (config.video === false) key += '-v';
+
+        // Distinguish sessions that target different sources or capabilities, so cards
+        // sharing an entity but differing in url/url_type/image_url/microphone do not
+        // collide onto (and silently inherit) the first card's session and config.
+        // ice_servers joins the variant ONLY when configured, so existing installs keep
+        // their historical keys (and stored background pins) unchanged.
+        const variantParts = [
+            config.url_type ?? '',
+            config.url ?? '',
+            config.image_url ?? '',
+            config.microphone === true ? 'm' : ''
+        ];
+        if (config.ice_servers) {
+            try { variantParts.push(JSON.stringify(config.ice_servers)); } catch { }
+        }
+        const variant = variantParts.join('|');
+        let hash = 5381;
+        for (let i = 0; i < variant.length; i++) {
+            hash = ((hash * 33) ^ variant.charCodeAt(i)) >>> 0;
+        }
+        key += '-' + hash.toString(36);
 
         return key;
     }
 
     static getInstance(config) {
-        let hass = document.body.querySelector("home-assistant")?.hass;
+        let hass = WebRTCsession.resolveHass();
         let key = WebRTCsession.key(config);
         let session = WebRTCsession.sessions.get(key);
+        if (session && (session.isTerminated || !WebRTCsession.isSessionAlive(session))) {
+            WebRTCsession.sessions.delete(key);
+            session = null;
+        }
         if (!session) {
             session = new WebRTCsession(key, hass, config);
             WebRTCsession.sessions.set(key, session);
-            console.debug(`****** created session ${key} #${WebRTCsession.sessions.size}`);
+            BackgroundManager.getInstance().adoptSession(session);
+            console.debug(`****** created session ${session.id} #${WebRTCsession.sessions.size}`);
         }
-        return session; 
+        return session;
+    }
+
+    static resolveHass() {
+        try {
+            return topWindow.document?.body?.querySelector("home-assistant")?.hass
+                ?? document.body.querySelector("home-assistant")?.hass;
+        } catch {
+            return document.body.querySelector("home-assistant")?.hass;
+        }
     }
 
     async determineUnmuteEnabled() {
@@ -149,7 +258,7 @@ class WebRTCsession {
      * @returns {string} Formatted byte string.
      */
     formatBytes(a, b = 2) {
-        if (!+a) return "0 Bytes";
+        if (!Number.isFinite(a) || a <= 0) return "0 Bytes";
         const c = 0 > b ? 0 : b,
             d = Math.floor(Math.log(a) / Math.log(1024));
         return `${parseFloat((a / Math.pow(1024, d)).toFixed(c))} ${["Bytes", "KB", "MB", "GB", "TB", "PB", "EB", "ZB", "YB"][d]}`;
@@ -199,23 +308,35 @@ class WebRTCsession {
 
         try {
             const result = await call.peerConnection.getStats(null);
+            let transportBytes;
+            let inboundBytes = 0;
             result.forEach(report => {
                 if (report.type === "transport") {
                     // RTCTransportStats
-                    this.stats.peerBytesReceived = report["bytesReceived"] || 0;
+                    transportBytes = report["bytesReceived"];
                     this.stats.tlsVersion = report["tlsVersion"] || "";
                     this.stats.dtlsCipher = report["dtlsCipher"] || "";
                     this.stats.srtpCipher = report["srtpCipher"] || "";
                 }
-                else if (report.type === "inbound-rtp" && report.kind === 'video') {
-                    // RTCInboundRtpStreamStats
-                    this.stats.frameWidth = report["frameWidth"] || 0;
-                    this.stats.frameHeight = report["frameHeight"] || 0;
-                    this.stats.framesDecoded = report["framesDecoded"] || 0;
-                    this.stats.framesDropped = report["framesDropped"] || 0;
-                    this.stats.totalFreezesDuration = report["totalFreezesDuration"] || 0;
+                else if (report.type === "inbound-rtp") {
+                    inboundBytes += report["bytesReceived"] || 0;
+                    if ((report.kind || report.mediaType) === 'video') {
+                        // RTCInboundRtpStreamStats
+                        this.stats.frameWidth = report["frameWidth"] || 0;
+                        this.stats.frameHeight = report["frameHeight"] || 0;
+                        this.stats.framesDecoded = report["framesDecoded"] || 0;
+                        this.stats.framesDropped = report["framesDropped"] || 0;
+                        this.stats.totalFreezesDuration = report["totalFreezesDuration"] || 0;
+                    }
                 }
             });
+
+            // Firefox does not populate transport.bytesReceived (the whole 'transport'
+            // report type arrived only in FF 153); fall back to summing inbound-rtp so
+            // the stats overlay doesn't report 0 B/s while a stream is playing.
+            this.stats.peerBytesReceived = (typeof transportBytes === 'number' && transportBytes > 0)
+                ? transportBytes
+                : inboundBytes;
 
         } catch (err) {
             this.trace(`Error fetching stats: ${err.message}`);
@@ -249,8 +370,8 @@ class WebRTCsession {
             const deltaFrames = (current.framesDecoded) - (prev.framesDecoded);
             const deltaTime = (current.timestamp) - (prev.timestamp);
 
-            if (deltaFrames < 0 || deltaTime <= 0) {
-                // framesDecoded has *decreased*, we've likely had a reset
+            if (deltaFrames < 0 || deltaTime <= 0 || deltaBytes < 0) {
+                // counters decreased (e.g. framesDecoded/bytesReceived reset on reconnect); rebase
                 this.statsHistory = [current];
                 return;
             }
@@ -304,17 +425,103 @@ class WebRTCsession {
     }
 
     get isAnyCardPlaying() {
-        const hasCardPlaying = [...this.state.cards].some(card => card.isPlaying === true);
+        const hasCardPlaying = [...this.state.cards].some(card => card.isPlayingActive === true);
         return hasCardPlaying;
     }
 
     get isAnyCardPlayingVideo() {
-        const hasCardPlayingVideo = [...this.state.cards].some(card => card.isPlayingVideo === true);
+        const hasCardPlayingVideo = [...this.state.cards].some(card => card.isPlayingVideoActive === true);
         return hasCardPlayingVideo;
     }
 
     get isStatsEnabled() {
         return WebRTCsession.globalStats || [...this.state.cards].some(card => card.config.stats);
+    }
+
+    get hasVisibleVideoCards() {
+        return [...this.state.cards].some(card => card.isVisibleInViewport && card.config.video !== false);
+    }
+
+    get shouldKeepBackgroundAudio() {
+        return this.background && this.config.audio !== false && !this.hasVisibleVideoCards;
+    }
+
+    get shouldShedBackgroundVideo() {
+        // While only the hidden background card holds the stream, negotiating video wastes
+        // bandwidth/decode on frames nothing renders. Shed it from the offer unless the
+        // config opts out or audio-only offers have repeatedly failed against this source.
+        return this.shouldKeepBackgroundAudio
+            && this.config.video === true
+            && this.config.background_video !== 'keep'
+            && this.audioOnlyFailures < 2;
+    }
+
+    get isVideoDeferred() {
+        return !this.shouldKeepBackgroundAudio && this.config.video !== false && Date.now() < this.videoDeferredUntil;
+    }
+
+    get videoDeferRemainingMs() {
+        return Math.max(0, this.videoDeferredUntil - Date.now());
+    }
+
+    noteInterest() {
+        this.lastInterestDate = Date.now();
+    }
+
+    relieveVideoPressure(force = false) {
+        const next = force ? 0 : Math.max(0, this.videoPressure - 1);
+        if (next === this.videoPressure && (!force || this.videoDeferredUntil === 0)) return false;
+
+        this.videoPressure = next;
+        if (force || next === 0) {
+            this.videoDeferredUntil = 0;
+        }
+        return true;
+    }
+
+    deferVideo(reason = undefined, ms = WebRTCsession.VIDEO_DEFER_BASE_MS) {
+        if (this.config.video === false) return 0;
+        if (this.shouldKeepBackgroundAudio) {
+            this.trace(`Ignoring video defer while preserving background audio${reason ? `: ${reason}` : ''}`);
+            return 0;
+        }
+
+        const pressure = Math.min(this.videoPressure + 1, 5);
+
+        const delay = Math.max(
+            ms,
+            Math.min(WebRTCsession.VIDEO_DEFER_MAX_MS, WebRTCsession.VIDEO_DEFER_BASE_MS * (2 ** (pressure - 1)))
+        );
+        const until = Date.now() + delay;
+        if (until <= this.videoDeferredUntil) return delay;
+
+        // Only escalate backoff pressure when this defer actually extends the window, so a
+        // burst of media events from a single outage does not saturate the backoff to the cap.
+        this.videoPressure = pressure;
+        this.videoDeferredUntil = until;
+        this.trace(`Video deferred ${delay}ms${reason ? `: ${reason}` : ''}`);
+
+        clearTimeout(this.watchdogTimeoutId);
+        this.watchdogTimeoutId = undefined;
+
+        if (this.state.cards.size > 0 && !this.isTerminated) {
+            this.play();
+        }
+        return delay;
+    }
+
+    getImageLoopDelay(interval) {
+        if (this.imageLoopPhase == null) {
+            let hash = 5381;
+            for (let i = 0; i < this.key.length; i++) {
+                hash = ((hash * 33) ^ this.key.charCodeAt(i)) >>> 0;
+            }
+            this.imageLoopPhase = hash;
+        }
+
+        const phase = this.imageLoopPhase % Math.max(1, interval);
+        const delay = interval - ((Date.now() + phase) % interval);
+        return Math.max(10, delay || interval);
     }
 
     /**
@@ -331,8 +538,15 @@ class WebRTCsession {
             return WebRTCsession.IMAGE_FETCH_INTERVAL_MS;
         }
 
-        const interval = Math.min(...intervals);
-        return Math.max(10, interval);
+        // image_interval === 0 is a sentinel meaning "polling disabled" for that card.
+        // Honor it (instead of clamping 0 up to 10ms, which produced a fetch storm) by
+        // returning 0 only when every card disables polling; otherwise use the smallest
+        // positive interval.
+        const positive = intervals.filter(i => i > 0);
+        if (positive.length === 0) {
+            return 0;
+        }
+        return Math.max(10, Math.min(...positive));
     }
     
     imageLoop() {
@@ -347,10 +561,11 @@ class WebRTCsession {
         const interval = this.getMinCardImageInterval();
         if (interval == 0) return;
 
+        const delay = this.getImageLoopDelay(interval);
         this.imageLoopTimeoutId = setTimeout(() => {
             this.imageLoopTimeoutId = undefined;
             this.imageLoop();
-        }, interval);
+        }, delay);
 
         if (this.isAnyCardPlayingVideo) return;
         this.fetchImage();
@@ -360,26 +575,59 @@ class WebRTCsession {
         if (id !== this.watchdogTimeoutId) {
             return;
         }
+        if (this.playRunning) {
+            // A play() tick is already executing (suspended at an await). Don't run a
+            // second body concurrently; the in-flight tick will reschedule the loop.
+            return;
+        }
 
         let call = null;
+        let live = false;
+        let videoDeferred = false;
 
+        this.playRunning = true;
         try {
 
+            if (this.isTerminated) return;   // finally still runs and will not reschedule
+
+            const now = Date.now();
+            const tickGap = this.lastTickDate ? now - this.lastTickDate : 0;
+            this.lastTickDate = now;
+            const starved = tickGap > WebRTCsession.TICK_STARVATION_MS;
+
             call = this.activeCall;
-            const live = call && this.isStreaming && (this.config.video === false || this.isAnyCardPlaying);
+            live = !!(call && this.isStreaming && (this.config.video === false || this.isAnyCardPlaying));
+            videoDeferred = this.isVideoDeferred;
             const isStatsEnabled = this.isStatsEnabled;
 
             if (!id) {
+                clearTimeout(this.imageLoopTimeoutId);
                 this.imageLoopTimeoutId = undefined;
                 this.setStatus('reset');
                 this.resetStats();
             }
 
             this.imageLoop();
+            this.evaluateBackground(now);
 
-            if (this.config.video === false && this.config.audio === false) {
+            if (this.parked) {
+                // Background session parked (muted/expired): image loop only, no WebRTC.
+                if (call) {
+                    this.trace(`Background parked (${this.parked}); stopping call`);
+                    await this.endCall(call);
+                    call = null;
+                }
+            }
+            else if (videoDeferred) {
+                if (call) {
+                    this.trace('Video deferred; falling back to image loop');
+                    await this.endCall(call);
+                    call = null;
+                }
+            }
+            else if (this.config.video === false && this.config.audio === false) {
                 // WebRTC disabled by configuration
-            }           
+            }
             else if (!call || call.reconnectDate === 0) {
                 call = await this.startCall();
                 this.state.activeCall = call;
@@ -394,14 +642,30 @@ class WebRTCsession {
                 }
             }
             else {
-                this.trace(`Play watchdog timeout`);
-                await this.endCall(call);
-                call = null;
+                // The deadline is wall-clock; when hidden-tab timer throttling, freeze/resume,
+                // or bfcache restore starves ticks past the deadline, don't tear down a call
+                // whose media demonstrably kept flowing during the gap.
+                const recentMedia = [...this.state.cards].some(card =>
+                    now - card.lastMediaActivityDate < WebRTCsession.RENDERING_TIMEOUT_MS + tickGap);
+                if (starved && this.isStreaming && recentMedia) {
+                    this.trace(`Play watchdog starved ${tickGap}ms; extending deadline`);
+                    this.extendCallTimeout(call, WebRTCsession.RENDERING_TIMEOUT_MS);
+                }
+                else {
+                    this.trace(`Play watchdog timeout`);
+                    if (call.videoShed && !call.everConnected) this.noteAudioOnlyFailure();
+                    await this.endCall(call);
+                    // Restart in the SAME tick: under intensive throttling (1 tick/min when
+                    // hidden with no live track) a next-tick restart doubles every outage.
+                    call = await this.startCall();
+                    this.state.activeCall = call;
+                }
             }
 
             if (isStatsEnabled) {
                 await this.updateStatistics();
             }
+            live = !!(call && this.isStreaming && (this.config.video === false || this.isAnyCardPlaying));
             this.eventTarget.dispatchEvent(new CustomEvent('heartbeat', { detail: {live: live} }));
 
         }
@@ -410,8 +674,19 @@ class WebRTCsession {
             this.trace(`Play ${err.name}: ${err.message}`);
         }
         finally {
+            this.playRunning = false;
+            if (this.isTerminated && this.state.cards.size === 0) {
+                this.watchdogTimeoutId = undefined;
+                return;
+            }
+
             const now = Date.now();
-            const intervalRemaining = 1000 - (now % 1000);
+            const intervalRemaining = videoDeferred && !call
+                ? Math.min(
+                    this.videoDeferRemainingMs || this.getImageLoopDelay(Math.max(1000, this.getMinCardImageInterval())),
+                    this.getImageLoopDelay(Math.max(1000, this.getMinCardImageInterval()))
+                )
+                : 1000 - (now % 1000);
             const timeoutRemaining = call ? call.reconnectDate - now : intervalRemaining;
             const loopDelay = Math.max(0, Math.min(intervalRemaining, timeoutRemaining));
 
@@ -442,37 +717,169 @@ class WebRTCsession {
 
         clearTimeout(this.watchdogTimeoutId);
         this.watchdogTimeoutId = undefined;
+        clearTimeout(this.imageLoopTimeoutId);
+        this.imageLoopTimeoutId = undefined;
         this.timeoutCall(call);
-        
+
         this.trace('Restarting call');
         this.play();
+    }
+
+    /**
+     * Forces an immediate watchdog tick (clears any scheduled tick first). Used after
+     * suspension/throttling, on visibility changes, and by the background ticker so
+     * recovery never waits out a throttled setTimeout.
+     */
+    kick() {
+        if (this.playRunning || this.isTerminated) return;
+        clearTimeout(this.watchdogTimeoutId);
+        this.watchdogTimeoutId = undefined;
+        this.play();
+    }
+
+    /**
+     * Background fail-safe evaluation, run once per watchdog tick.
+     * - Parks a hidden background stream whose audio is autoplay-blocked (muted with no
+     *   possible gesture): a stream nobody can hear must not burn bandwidth all night,
+     *   but it is parked LOUDLY (dock chip + 'parked' event), never dropped silently.
+     * - Applies the optional background_timeout TTL, counted from last user interest.
+     */
+    evaluateBackground(now) {
+        const config = this.config;
+
+        // Parking only ever applies to an UNATTENDED hidden stream. Any visible card -
+        // including a visible audio-only card, which shouldKeepBackgroundAudio does not
+        // count as a "visible video card" - means an active viewer: never park, and
+        // resume anything parked.
+        const anyCardVisible = [...this.state.cards].some(card => card.isVisibleInViewport);
+        if (!this.shouldKeepBackgroundAudio || this.state.cards.size === 0 || anyCardVisible) {
+            this.mutedBackgroundSince = null;
+            if (this.parked) this.unpark();
+            return;
+        }
+
+        const timeoutMinutes = Number(config.background_timeout) || 0;
+        if (timeoutMinutes > 0 && !this.parked
+            && now - this.lastInterestDate > timeoutMinutes * 60000) {
+            this.park('expired');
+            return;
+        }
+
+        if (!this.isStreamingAudio) {
+            this.mutedBackgroundSince = null;
+            return;
+        }
+
+        const audible = [...this.state.cards].some(card => card.media && !card.media.muted && card.isPlaying);
+        if (audible) {
+            this.mutedBackgroundSince = null;
+            if (this.parked === 'muted') this.unpark();
+            return;
+        }
+
+        if (WebRTCsession.unmuteEnabled) return; // pending unmute flush will make it audible
+
+        this.mutedBackgroundSince ??= now;
+        const configuredGrace = Number(config.background_muted_grace);
+        const grace = (Number.isFinite(configuredGrace) && configuredGrace >= 0)
+            ? configuredGrace : WebRTCsession.BACKGROUND_MUTED_GRACE_MS;   // 0 = park immediately
+        if (config.background_mute_policy !== 'keep' && !this.parked
+            && now - this.mutedBackgroundSince >= grace) {
+            this.park('muted');
+        }
+    }
+
+    noteAudioOnlyFailure() {
+        this.audioOnlyFailures = Math.min(2, this.audioOnlyFailures + 1);
+        if (this.audioOnlyFailures >= 2) {
+            this.trace('Audio-only offers failing; keeping video in background calls');
+        }
+    }
+
+    park(reason) {
+        if (this.parked === reason) return;
+        this.parked = reason;
+        this.trace(`Background parked: ${reason}`);
+        this.timeoutCall(this.activeCall);
+        this.eventTarget.dispatchEvent(new CustomEvent('parked', { detail: { parked: reason } }));
+        this.kick();
+    }
+
+    unpark() {
+        if (!this.parked) return;
+        this.trace(`Background unparked (${this.parked})`);
+        this.parked = null;
+        this.mutedBackgroundSince = null;
+        this.noteInterest();
+        this.eventTarget.dispatchEvent(new CustomEvent('parked', { detail: { parked: null } }));
+        this.kick();
+    }
+
+    /**
+     * Designates `card` as the single hidden holder of the background stream.
+     * Returns false when another live designee already holds it (the caller then
+     * fully detaches), making "which card keeps streaming" deterministic.
+     */
+    claimBackground(card) {
+        if (!this.background) return false;
+        const current = this.state.backgroundCard;
+        if (current && current !== card && this.state.cards.has(current)) return false;
+        this.state.backgroundCard = card;
+        BackgroundManager.getInstance().broadcastClaim(this.key);
+        return true;
+    }
+
+    releaseBackground(card = undefined) {
+        const current = this.state.backgroundCard;
+        if (!current || (card && card !== current)) return;
+        this.state.backgroundCard = null;
+        if (!current.isVisibleInViewport && this.state.cards.has(current)) {
+            current.applyVisibility(false, false);
+        }
     }
 
     async terminate() {
         clearTimeout(this.watchdogTimeoutId);
         clearTimeout(this.imageLoopTimeoutId);
-        clearTimeout(this.fetchImageTimeoutId);
         clearTimeout(this.terminationTimeoutId);
-        
+
         this.watchdogTimeoutId = undefined;
         this.imageLoopTimeoutId = undefined;
-        this.fetchImageTimeoutId = undefined;
         this.terminationTimeoutId = undefined;
+        this.latestCallId = null;
+
+        try { this.fetchAbortController?.abort(); } catch { }
+
+        // Mark terminated BEFORE awaiting teardown so any watchdog tick suspended at an
+        // await observes isTerminated and neither reschedules itself nor starts a new call.
+        this.setStatus('terminated');
 
         for (const call of [...this.state.calls.values()]) {
             await this.endCall(call);
         }
 
-        this.setStatus('terminated');
+        // A suspended play() tick may have re-armed the watchdog while we awaited above.
+        clearTimeout(this.watchdogTimeoutId);
+        this.watchdogTimeoutId = undefined;
+
+        BackgroundManager.getInstance().releaseLease(this.key);
+
+        // A replacement session may have been created under this key while the teardown
+        // awaits above were suspended; never delete the replacement.
+        if (WebRTCsession.sessions.get(this.key) === this) {
+            WebRTCsession.sessions.delete(this.key);
+        }
+        WebRTCsession.requestStreamBudgetRebalance();
     }
 
     attachCard(card, messageHandler) {
 
-        this.trace(`Attaching new card ${card.instanceId} to session`);
-
-        if (this.background) {
-            card.releaseOtherBackgroundCards();
+        if (this.isTerminated) {
+            this.trace(`attachCard ignored: session terminated`);
+            return;
         }
+
+        this.trace(`Attaching new card ${card.instanceId} to session`);
 
         if (this.terminationTimeoutId) {
             clearTimeout(this.terminationTimeoutId);
@@ -480,9 +887,26 @@ class WebRTCsession {
             this.trace("Scheduled termination aborted due to session attachment");
         }
 
-        if (this.state.cards.has(card)) return;
+        if (this.state.backgroundCard === card) {
+            // The hidden designee became visible again: promote it back to a normal card.
+            this.state.backgroundCard = null;
+        }
+
+        if (this.state.cards.has(card)) {
+            this.noteInterest();
+            return;
+        }
 
         this.state.cards.add(card);
+        this.noteInterest();
+        WebRTCsession.rebalanceStreamBudget();
+
+        if (this.background) {
+            // One media pipeline per session: a newly attached (visible) card supersedes
+            // the hidden designee. Release AFTER adding, so the release path can never
+            // drop the card count to zero and trigger the termination grace timer.
+            this.releaseBackground();
+        }
 
         const sessionEventTypes = [
             'status',
@@ -506,7 +930,9 @@ class WebRTCsession {
         this.tracing = this.tracing || card.config.debug || WebRTCsession.globalDebug;
 
         if (card.isVisibleInViewport || this.background) {
-            this.play();
+            // kick() (not play()) so a stale scheduled tick can't swallow the request and a
+            // throttled timer can't delay recovery when a card just became visible.
+            this.kick();
         } else {
             this.trace("attachCard: card is not visible & background=false => not playing");
         }
@@ -538,6 +964,10 @@ class WebRTCsession {
         });
 
         this.state.cards.delete(card);
+        if (this.state.backgroundCard === card) {
+            this.state.backgroundCard = null;
+        }
+        WebRTCsession.requestStreamBudgetRebalance();
         const remaining = this.state.cards.size;
         if (remaining > 0) {
             this.trace(`Detached ${card.instanceId}, cards remaining in this session: ${remaining}`);
@@ -603,13 +1033,14 @@ class WebRTCsession {
     }
 
     _trace(message, o) {
-        const call = this.activeCall;
-        const callStarted = call?.startDate;
         const now = Date.now();
+
+        const call = this.activeCall;
+        const callId = call?.id ?? 'nocall';
+        const callStarted = call?.startDate;
+        const timestamp = callStarted ? (now - callStarted).toString().padStart(9, '0') : (new Date).getTime();
         
-        const timestamp = callStarted ? (now - callStarted) : (new Date).getTime();
-        const id = call?.id ?? this.key;
-        const text = `${id}:${timestamp}: ${message}`;
+        const text = `${this.id} | ${callId} | ${timestamp}: ${message}`;
         if (o)
             console.debug(text, o);
         else
@@ -631,6 +1062,11 @@ class WebRTCsession {
 
     setStatus(value) {
         if (this.state.status === value) return;
+        // 'terminated' is terminal (REQ-SESS-6). Without this latch, teardown paths that
+        // resume AFTER terminate() (endCallFast's 'disconnected', a suspended startCall's
+        // 'error') flip isTerminated back to false and resurrect a zombie watchdog chain
+        // on a session already removed from the registry.
+        if (this.state.status === 'terminated') return;
         this.state.status = value;
         this.trace(`STATE ${value}`);
         this.eventTarget.dispatchEvent(new CustomEvent('status', { detail: { status: value } }));
@@ -641,20 +1077,40 @@ class WebRTCsession {
     }
         
     get background() {
-        return localStorage.getItem(`webrtc.${this.key}.background`)?.toLowerCase() === 'true';
+        // A stored runtime preference (set via the UI) is authoritative; otherwise fall
+        // back to the config default. Persistence lives in the BackgroundManager registry
+        // (in-memory cached — this is a hot path called from media event handlers).
+        return BackgroundManager.getInstance().isEnabled(this.key, this.config.background === true);
     }
 
     set background(value) {
-        localStorage.setItem(`webrtc.${this.key}.background`, value);
-        this.eventTarget.dispatchEvent(new CustomEvent('background', { detail: { background: value } }));
+        BackgroundManager.getInstance().setEnabled(this.key, value === true, this.describeForRegistry());
+        WebRTCsession.requestStreamBudgetRebalance();
+        // The 'background' session event is dispatched by the manager (single dispatch
+        // point shared with the dock and cross-tab change paths).
+    }
+
+    describeForRegistry() {
+        let friendlyName = this.config.entity;
+        try {
+            friendlyName = this.hass?.states?.[this.config.entity]?.attributes?.friendly_name ?? friendlyName;
+        } catch { }
+        return {
+            entity: this.config.entity,
+            friendlyName,
+            returnPath: BackgroundManager.getInstance().currentPath(),
+            dock: this.config.dock !== false
+        };
     }
 
     get microphone() {
-        return localStorage.getItem(`webrtc.${this.key}.microphone`)?.toLowerCase() === 'true';
+        const stored = safeStorage.get(`webrtc.${this.key}.microphone`);
+        if (stored != null) return stored.toLowerCase() === 'true';
+        return this.config.microphone === true;
     }
 
     set microphone(value) {
-        localStorage.setItem(`webrtc.${this.key}.microphone`, value);        
+        safeStorage.set(`webrtc.${this.key}.microphone`, String(value === true));
         if (this.isStreaming)
             this.restartCall();
         this.eventTarget.dispatchEvent(new CustomEvent('microphone', { detail: { microphone: value } }));
@@ -673,7 +1129,12 @@ class WebRTCsession {
     
         const iceState = pc.iceConnectionState;
         if (!(iceState === "connected" || iceState === "completed")) return false;
-    
+
+        // iceConnectionState reaches 'connected' before DTLS completes; media cannot flow
+        // until connectionState is 'connected', so don't extend liveness deadlines during
+        // the ICE-connected/pre-DTLS window.
+        if (pc.connectionState !== 'connected') return false;
+
         const remoteStream = call.remoteStream;
         if (!remoteStream) return false;
     
@@ -693,9 +1154,16 @@ class WebRTCsession {
     
         return audioTracks.some(track => track.readyState === 'live');
     }
+    
+    latestCallId = null;
 
     async startCall() {
         const { config } = this;
+
+        if (this.isTerminated) {
+            this.trace('startCall ignored: session terminated');
+            return null;
+        }
 
         if (config.video === false && config.audio === false) {
             this.trace('WebRTC disabled');
@@ -707,21 +1175,23 @@ class WebRTCsession {
         }
 
         const now = Date.now();
-        const seconds = Math.floor((now / 1000) % 60);
-        const minutes = Math.floor((now / 60000) % 60);
-        const salt = `${minutes.toString().padStart(2, '0')}${seconds.toString().padStart(2, '0')}`;
 
         const call = {
-            id: `${this.key}_${salt}`,
+            id: `call-${randomSalt()}`,
             startDate: now,
             reconnectDate: 0,
             signalingChannel: null,
             peerConnection: null,
             localStream: null,
-            remoteStream: null
+            remoteStream: null,
+            pendingCandidates: [],
+            closed: false,
+            ended: false,
+            videoShed: this.shouldShedBackgroundVideo,
+            everConnected: false
         };
-
         this.state.calls.set(call.id, call);
+        this.latestCallId = call.id;
 
         try {
             this.trace(`Call started`);
@@ -749,11 +1219,14 @@ class WebRTCsession {
                 throw new Error('Signaling channel is not available.');
             }
 
-            this.createPeerConnection(call);
+            this.createPeer(call);
 
-            if (config.video === true) {
+            if (config.video === true && !call.videoShed) {
                 call.peerConnection.addTransceiver('video', { direction: 'recvonly' });
                 this.trace('Configured video transceiver: receive-only.');
+            }
+            else if (call.videoShed) {
+                this.trace('Background: video shed from offer (audio-only while hidden).');
             }
 
             if (call.localStream && call.localStream.getAudioTracks().length > 0) {
@@ -782,37 +1255,13 @@ class WebRTCsession {
             this.trace(this.lastError);
             this.setStatus('error');
 
+            // Only genuine establishment failures count against audio-only shedding;
+            // deliberate teardowns (park, pagehide, visible-restore restart) must not.
+            if (call.videoShed && !call.everConnected) this.noteAudioOnlyFailure();
+
             await this.endCall(call);
             return null;
         }
-
-        (async () => {
-            try {
-                const offer = await call.peerConnection.createOffer({
-                    voiceActivityDetection: false,
-                    iceRestart: true
-                });
-                this.trace('Offer created.');
-        
-                await call.peerConnection.setLocalDescription(offer);
-                this.trace('Local description set successfully.');
-        
-                if (call.signalingChannel) {
-                    this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
-                    await call.signalingChannel.sendOffer(offer);
-                    this.trace('Offer sent via signaling channel.');
-                } 
-                else {
-                    throw new Error('Signaling channel is not available.');
-                }
-            } catch (err) {
-                this.lastError = `Error negotiating WebRTC call. ${err.name}: ${err.message}`;
-                this.trace(this.lastError);
-                this.setStatus('error');
-
-                await this.endCall(call);
-            }
-        })();
 
         return call;
     }
@@ -820,12 +1269,32 @@ class WebRTCsession {
     async endCall(call) {
 
         if (!call) return;
+        call.closed = true;
 
-        // attempt to refresh image before tear down 
+        // attempt to refresh image before tear down
         try {
             await this.fetchImage();
         } catch { }
-         
+
+        this.endCallFast(call);
+    }
+
+    /**
+     * Fully synchronous teardown (no awaits): safe to run inside 'pagehide'/'freeze',
+     * where an awaited network fetch would never complete and the transports would be
+     * left to time out server-side.
+     */
+    endCallFast(call) {
+
+        if (!call || call.ended) return;
+        call.closed = true;
+        call.ended = true;
+
+        if (call.disconnectGraceTimeoutId) {
+            clearTimeout(call.disconnectGraceTimeoutId);
+            call.disconnectGraceTimeoutId = undefined;
+        }
+
         const sc = call.signalingChannel;
         const pc = call.peerConnection;
         const localStream = call.localStream;
@@ -859,7 +1328,7 @@ class WebRTCsession {
                 } catch { }
             });
         }
-        
+
         call.signalingChannel = null;
         call.peerConnection = null;
         call.remoteStream = null;
@@ -874,10 +1343,12 @@ class WebRTCsession {
 
         this.trace('Call ended');
         this.timeoutCall(call);
-        this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: false} }));        
+        WebRTCsession.requestStreamBudgetRebalance();
+        this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: null } }));
+        this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: false} }));
     }
 
-    createPeerConnection(call) { 
+    createPeer(call) { 
         const { config } = this; 
 
         if (call.peerConnection) {
@@ -886,30 +1357,110 @@ class WebRTCsession {
             call.peerConnection = null;
         }
 
-        const rtcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+        const isStale = () => call.closed || call.id !== this.latestCallId || !this.state.calls.has(call.id);
+
+        // Historical default preserved for compatibility. ice_servers: [] disables STUN
+        // entirely (host candidates suffice for LAN peers and nothing pings Google);
+        // an array of RTCIceServer objects replaces it (own STUN/TURN for remote access).
+        const iceServers = Array.isArray(config.ice_servers)
+            ? config.ice_servers
+            : [{ urls: 'stun:stun.l.google.com:19302' }];
+        const rtcConfig = { iceServers };
         const pc = new RTCPeerConnection(rtcConfig);
 
-        pc.oniceconnectionstatechange = () => {
-            this.trace(`ICE state: ${pc.iceConnectionState}`);
+        pc.onnegotiationneeded = async () => {
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
 
-            const iceState = pc.iceConnectionState;
-            switch (iceState) {
-                case "completed":
+            this.trace('Negotiation needed');
+
+            if (!call.signalingChannel || !call.signalingChannel.isOpen) {
+                this.trace('Signaling channel unavailable for renegotiation; restarting call');
+                this.restartCall(call);
+                return;
+            }
+
+            try {
+                // No options: the m-lines are fully defined by the transceivers set up in
+                // startCall (including video shedding). voiceActivityDetection was removed
+                // from the spec, offerToReceive* are legacy and would re-add a recvonly
+                // video m-line a shed call deliberately omitted, and iceRestart is a no-op
+                // on a fresh RTCPeerConnection (restarts always recreate the peer).
+                const offer = await pc.createOffer();
+                if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+                this.trace('Offer created.');
+
+                await pc.setLocalDescription(offer);
+                if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+                this.trace('Local description set successfully.');
+
+                 if (call.signalingChannel) {
+                    this.extendCallTimeout(call, WebRTCsession.SIGNALING_TIMEOUT_MS);
+                    await call.signalingChannel.sendOffer(offer);
+                    this.trace('Offer sent via signaling channel.');
+                }
+                else {
+                    throw new Error('Signaling channel is not available.');
+                }
+
+            } catch (err) {
+                // A call ended mid-negotiation rejects the suspended awaits; that is
+                // teardown, not an error - don't stomp the status or trigger a redundant
+                // restart on a deliberately-closed call.
+                if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+                this.lastError = `Error negotiating WebRTC call. ${err.name}: ${err.message}`;
+                this.trace(this.lastError);
+                this.setStatus('error');
+                this.restartCall(call); // Ensure restart on failure
+            }
+        };
+        
+        pc.onconnectionstatechange = () => {
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+
+            const connectionState = pc.connectionState;
+            this.trace(`Connection state: ${connectionState}`);
+
+            switch (connectionState) {
                 case "connected":
+                    call.everConnected = true;
+                    if (call.videoShed) this.audioOnlyFailures = 0;
                     this.setStatus('connected');
                     this.eventTarget.dispatchEvent(new CustomEvent('connected', { detail: {connected: true} }));
                     this.extendCallTimeout(call, WebRTCsession.RENDERING_TIMEOUT_MS);
+                    if (call.disconnectGraceTimeoutId) {
+                        clearTimeout(call.disconnectGraceTimeoutId);
+                        call.disconnectGraceTimeoutId = undefined;
+                    }
                     break;
-
-                case "failed":
-                case "closed":
                 case "disconnected":
+                    // 'disconnected' is frequently transient and self-recovers (brief packet
+                    // loss, network roam). Only restart if it has not returned to a connected
+                    // state after a grace period, instead of tearing down on every blip.
+                    if (!call.disconnectGraceTimeoutId) {
+                        call.disconnectGraceTimeoutId = setTimeout(() => {
+                            call.disconnectGraceTimeoutId = undefined;
+                            if (isStale()) return;
+                            // 'completed' exists only in the iceConnectionState enum, never
+                            // in connectionState; 'connected' is the sole healthy value here.
+                            const state = call.peerConnection?.connectionState;
+                            if (state !== 'connected') {
+                                this.trace(`Connection still ${state} after grace; restarting`);
+                                this.restartCall(call);
+                            }
+                        }, WebRTCsession.ICE_TIMEOUT_MS);
+                    }
+                    break;
+                case "failed":
+                    // 'closed' is unreachable via this event (local close() fires no
+                    // connectionstatechange), so only 'failed' needs the restart.
                     this.restartCall(call);
                     break;
             }
         };
 
         pc.onicecandidate = ev => {
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+
             if (!call.signalingChannel?.isOpen) {
                 this.trace(`Signaling channel closed, cannot send ICE '${ev?.candidate?.candidate}'`);
                 return;
@@ -925,24 +1476,47 @@ class WebRTCsession {
         };
 
         pc.ontrack = ev => {
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+
             const track = ev.track;
             this.trace(`Received ${track.kind} track ${track.id}`);
 
             if (!call.remoteStream) {
                 call.remoteStream = new MediaStream();
+                // Standard replacement for the deprecated pc.onremovestream (kept below as
+                // Chromium-only legacy): renegotiated-away tracks are removed, not 'ended'.
+                call.remoteStream.addEventListener('removetrack', () => {
+                    if (isStale()) return;
+                    if (call.remoteStream && call.remoteStream.getTracks().length === 0) {
+                        this.trace('Remote stream emptied (removetrack)');
+                        call.remoteStream = null;
+                        this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: null } }));
+                    }
+                });
             }
-            
+
             if (track.kind === 'audio' && config.audio === false) return;
             if (track.kind === 'video' && config.video === false) return;
 
             if (!call.remoteStream.getTracks().some(t => t.id === track.id)) {
-                
                 call.remoteStream.addTrack(ev.track);
+                track.addEventListener('ended', () => {
+                    if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+                    if (!call.remoteStream) return;
+                    this.trace(`Remote ${track.kind} track ended ${track.id}`);
+                    try { call.remoteStream.removeTrack(track); } catch { }
+                    if (call.remoteStream.getTracks().length === 0) {
+                        call.remoteStream = null;
+                    }
+                    this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: call.remoteStream } }));
+                });
                 this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: call.remoteStream } }));
             }
         };
 
         pc.onremovestream = (ev) => {
+            if (isStale()) { this.trace('Overlapping session event ignored'); return; }
+
             this.trace('Remote stream removed');
             call.remoteStream = null;
             this.eventTarget.dispatchEvent(new CustomEvent('remotestream', { detail: { remoteStream: call.remoteStream } }));
@@ -952,11 +1526,12 @@ class WebRTCsession {
     }
 
     async openSignalingChannel(call) {
-        const { config } = this; 
+        const { config } = this;
 
         let url;
         let signalingChannel = null;
 
+        this.refreshHass();
         this.trace(`Opening ${config.url_type} signaling channel`);
 
         if (config.url_type === 'go2rtc') {
@@ -976,7 +1551,7 @@ class WebRTCsession {
                 url += '&url=' + encodeURIComponent(config.url);
             if (config.entity)
                 url += '&entity=' + encodeURIComponent(config.entity);
-            const signature = await this.hass.callWS({
+            const signature = await this.hass?.callWS?.({
                 type: 'auth/sign_path',
                 path: url
             });
@@ -986,7 +1561,7 @@ class WebRTCsession {
             }
         }
         else if (config.url_type === 'webrtc-camera') {
-            const data = await this.hass.callWS({
+            const data = await this.hass?.callWS?.({
                 type: 'auth/sign_path',
                 path: '/api/webrtc/ws'
             });
@@ -1020,16 +1595,45 @@ class WebRTCsession {
             return;
         }
 
+        const addRemoteCandidate = async (candidate) => {
+            if (!candidate) return;
+            if (!call.peerConnection?.remoteDescription?.type) {
+                call.pendingCandidates.push(candidate);
+                this.trace(`Queued ICE candidate '${candidate.candidate}'`);
+                return;
+            }
+            // Plain init dictionaries are the modern form; the RTCIceCandidate wrapper is
+            // redundant and turns malformed inits into synchronous constructor throws.
+            await call.peerConnection.addIceCandidate(candidate);
+        };
+
+        const flushPendingCandidates = async () => {
+            if (!call.pendingCandidates?.length || !call.peerConnection?.remoteDescription?.type) return;
+            const pendingCandidates = call.pendingCandidates.splice(0);
+            for (const pendingCandidate of pendingCandidates) {
+                // Per-candidate tolerance, matching the direct oncandidate path: one bad
+                // candidate must not drop the rest of the batch or flag the session.
+                try {
+                    await call.peerConnection.addIceCandidate(pendingCandidate);
+                } catch (err) {
+                    this.trace(`addIceCandidate error: ${err.name}:${err.message}`);
+                }
+            }
+            this.trace(`Applied ${pendingCandidates.length} queued ICE candidate(s)`);
+        };
+
         try {
-            signalingChannel.oncandidate = (candidate) => {
+            signalingChannel.oncandidate = async (candidate) => {
+                const isStale = call.closed || call.id !== this.latestCallId || !this.state.calls.has(call.id);
+                if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
                 if (candidate) {
                     this.trace(`Received ICE candidate '${candidate.candidate}'`);
                 } else {
                     this.trace('Received end of ICE candidates');
                 }
                 try {
-                    if (candidate)
-                        call.peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+                    await addRemoteCandidate(candidate);
                 }
                 catch (err) {
                     this.trace(`addIceCandidate error: ${err.name}:${err.message}`);
@@ -1037,10 +1641,17 @@ class WebRTCsession {
             };
 
             signalingChannel.onanswer = async (answer) => {
+                const isStale = call.closed || call.id !== this.latestCallId || !this.state.calls.has(call.id);
+                if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
                 this.trace("Received answer");
+
                 try {
-                    await call.peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+                    // The RTCSessionDescription wrapper constructor is deprecated;
+                    // setRemoteDescription accepts the {type, sdp} init directly.
+                    await call.peerConnection.setRemoteDescription(answer);
                     this.trace(`Remote description set`);
+                    await flushPendingCandidates();
                 } catch (err) {
                     this.lastError = err.message;
                     this.trace(this.lastError);
@@ -1049,6 +1660,9 @@ class WebRTCsession {
             };
 
             signalingChannel.onerror = (err) => {
+                const isStale = call.closed || call.id !== this.latestCallId || !this.state.calls.has(call.id);
+                if (isStale) { this.trace('Overlapping session event ignored'); return; }
+
                 this.trace(`Signaling error: ${err.message}`);
                 this.lastError = err.message;
                 this.trace(this.lastError);
@@ -1077,11 +1691,22 @@ class WebRTCsession {
         }
     }
 
+    refreshHass() {
+        // Detached background cards stop receiving hass updates from Lovelace, so rotated
+        // entity_picture access tokens and signed-path calls would silently start failing.
+        // The root <home-assistant> element's hass is always fresh; a stale snapshot's
+        // .connected never turns false, so re-resolve unconditionally.
+        const fresh = WebRTCsession.resolveHass();
+        if (fresh && fresh !== this.hass) this.hass = fresh;
+    }
+
     async fetchImage(maximumCacheAge = 300) {
-        if (this.fetchImageTimeoutId) return;
+        if (this.fetchImageInFlight) return;
         if (maximumCacheAge > (Date.now() - this.state.image?.timestamp)) return;
 
-        const { config } = this; 
+        const { config } = this;
+
+        this.refreshHass();
 
         try {
             let url = null;
@@ -1099,29 +1724,40 @@ class WebRTCsession {
                 return;
             }
 
-            try {
-                const abort = new AbortController();
-                this.fetchImageTimeoutId = setTimeout(() => {
-                    abort.abort();
-                    this.fetchImageTimeoutId = undefined;
-                }, WebRTCsession.IMAGE_FETCH_TIMEOUT_MS);
+            // Per-invocation abort timer: a shared timeout-id field lets an interleaved
+            // teardown clear a newer fetch's timer and release the latch mid-flight.
+            this.fetchImageInFlight = true;
+            const abort = new AbortController();
+            this.fetchAbortController = abort;
+            const timerId = setTimeout(() => abort.abort(), WebRTCsession.IMAGE_FETCH_TIMEOUT_MS);
 
+            try {
                 const response = await fetch(url, {
                     signal: abort.signal,
                     cache: "no-store"
                 });
 
                 if (response?.ok) {
-                    clearTimeout(this.fetchImageTimeoutId);
                     await this.setImage(await response.blob());
+                }
+                else if (response) {
+                    // Surface auth expiry etc. instead of silently retrying forever; cancel
+                    // the unconsumed body so the connection isn't held until GC.
+                    try { await response.body?.cancel(); } catch { }
+                    this.trace(`Fetch image HTTP ${response.status}`);
+                    if (response.status === 401 || response.status === 403) {
+                        this.lastError = `Image fetch unauthorized (HTTP ${response.status})`;
+                    }
                 }
             }
             finally {
-                clearTimeout(this.fetchImageTimeoutId);
-                this.fetchImageTimeoutId = undefined;
+                clearTimeout(timerId);
+                if (this.fetchAbortController === abort) this.fetchAbortController = null;
+                this.fetchImageInFlight = false;
             }
         }
         catch (err) {
+            this.fetchImageInFlight = false;
             switch (err.name) {
                 case "AbortError":
                     this.trace(`Fetch image timeout`);
@@ -1140,7 +1776,6 @@ class WebRTCsession {
         const image = {
             blob: blob,
             size: blob.size,
-            hash: await this.hashBlob(blob),
             timestamp: Date.now()
         };
         this.state.image = image;
@@ -1154,50 +1789,6 @@ class WebRTCsession {
         }
     }
 
-    async hashBlob(blob) {
-        const buffer = await blob.arrayBuffer();
-        const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
-        return Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2, '0')).join('');
-    }
- 
-    async createThumbnail(width, height) {
-        const blob = this.state.image?.blob;
-        if (!blob) return null;
-
-        return new Promise((accept, reject) => {
-            const image = new Image();
-            image.onload = () => {
-                const canvas = document.createElement('canvas');
-                canvas.width = width;
-                canvas.height = height;
-
-                const scale = Math.min(width / image.naturalWidth, height / image.naturalHeight);
-                const scaledHeight = image.naturalHeight * scale;
-                const scaledWidth = image.naturalWidth * scale;
-                const type = "image/png";
-
-                canvas.getContext('2d').drawImage(image,
-                    (width - scaledWidth) / 2,
-                    (height - scaledHeight) / 2,
-                    scaledWidth,
-                    scaledHeight
-                );
-                URL.revokeObjectURL(image.src);
-
-                const thumbnail = {
-                    src: canvas.toDataURL(type),
-                    width: width,
-                    height: height,
-                    type: type
-                };
-                accept(thumbnail);
-            };
-            image.onerror = () => {
-                reject(new Error('Failed to load image for thumbnail'));
-            };
-            image.src = URL.createObjectURL(blob);
-        });
-    }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1215,7 +1806,8 @@ class WebRTCbabycam extends HTMLElement {
         super();
 
         WebRTCbabycam.instanceCount += 1;
-        this.instanceId = WebRTCbabycam.instanceCount;
+
+        this.instanceId = `${randomSalt()}-${WebRTCbabycam.instanceCount}`;
 
         this.rendered = false;
         this.playingWaitStartDate = null;
@@ -1224,17 +1816,42 @@ class WebRTCbabycam extends HTMLElement {
         this._cardConfig = null;
         this._cardMedia = null;
         this._cardSession = null;
-        
+
         this.resizeObserver = null;
         this.intersectionObserver = null;
         this.intersectionObserverCallback = this.intersectionObserverCallback.bind(this);
         this.documentVisibility = this.documentVisibility.bind(this);
+        this.fullscreenChanged = this.fullscreenChanged.bind(this);
         this.documentVisibilityListener = false;
+        this._pendingVisibility = null;
+        this.connectTimeoutId = undefined;
+        this._pendingDetachId = undefined;
+        this.ptzHideTimeoutId = undefined;
+
+        // Interaction (hold/tap) machinery: a global generation bounds every hold-repeat
+        // loop (bumped on render/disconnect so no loop survives its DOM), and a per-element
+        // expiring timestamp replaces the old add/remove click-suppressor dance.
+        this._interactionGen = 0;
+        this._holdSuppressUntil = new WeakMap();
+        this._holdGuarded = new WeakSet();
+        this._lastHoldFireDate = 0;
         this.sessionEvent = this.sessionEvent.bind(this); 
         this.mediaEvent = this.mediaEvent.bind(this); 
 
+        this.playPromise = null;
+        this.playGen = 0; 
         this.playTimeoutId = undefined;
         this.imageRefreshTimeoutId = undefined;
+        this.refreshStateTimeoutId = undefined;
+        this.mediaStaleTimeoutId = undefined;
+        this.videoFrameCallbackId = undefined;
+        this.videoFramePollTimeoutId = undefined;
+        this.liveFadeTimeoutId = undefined;
+        this.staleDebounceTimeoutId = undefined;
+        this.lastMediaActivityDate = 0;
+        this.lastActivitySample = null;
+        this._fullscreenVideoOverride = false;
+        this.lastError = null;
     }
 
     get config() {
@@ -1262,12 +1879,17 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     setDebugVisibility(show) {
-        const log = this.shadowRoot.querySelector('.log');
+        const log = this.shadowRoot?.querySelector('.log');
         if (!log) return;
 
         const { session } = this;
-        if (show) {            
+        if (show) {
             log.classList.remove('hidden');
+
+            if (!this._versionLogged) {
+                this._versionLogged = true;
+                this.appendTrace(`webrtc-babycam v${CARD_VERSION}`);
+            }
 
             if (session && session.tracing !== true)
                 session.tracing = true;
@@ -1311,18 +1933,24 @@ class WebRTCbabycam extends HTMLElement {
 
     setPTZVisibility(show) {
         const timeout = 4000;
-        const ptz = this.shadowRoot.querySelector('.ptz');
+        const ptz = this.shadowRoot?.querySelector('.ptz');
         if (!ptz) return;
 
-        const timer = ptz.getAttribute('show');
-        if (timer) {
-            clearTimeout(Number(timer));
-            ptz.removeAttribute('show');
-        }
+        // Timer handle lives in an instance field; the attribute is a pure boolean CSS
+        // marker. HTML only guarantees timer-id uniqueness among PENDING timers, so a
+        // stale id round-tripped through the DOM may cancel an unrelated later timer.
+        clearTimeout(this.ptzHideTimeoutId);
+        this.ptzHideTimeoutId = undefined;
 
         if (show) {
-            ptz.setAttribute('show',
-                setTimeout(() => { this.setPTZVisibility(false); }, timeout));
+            ptz.setAttribute('show', '');
+            this.ptzHideTimeoutId = setTimeout(() => {
+                this.ptzHideTimeoutId = undefined;
+                this.setPTZVisibility(false);
+            }, timeout);
+        }
+        else {
+            ptz.removeAttribute('show');
         }
     }
 
@@ -1344,6 +1972,7 @@ class WebRTCbabycam extends HTMLElement {
                 position: relative;
                 border-radius: 0px;
                 border-style: none;
+                isolation: isolate;
             }
             .media-container {
                 background: var(--primary-background-color);
@@ -1358,10 +1987,15 @@ class WebRTCbabycam extends HTMLElement {
                 margin: auto;
                 width: 100%;
                 background: transparent;
+                transition: filter 300ms linear, opacity 300ms linear;
             }
             video[playing="audiovideo"], video[playing="video"], video[playing="paused"] {
                 visibility: visible;
                 z-index: 2;
+            }
+            video[stale] {
+                filter: blur(3px);
+                opacity: 0.5;
             }
             .image:not([size]) ~ video {
                 position: static;
@@ -1452,8 +2086,7 @@ class WebRTCbabycam extends HTMLElement {
                 top: 12px;
                 cursor: default;
                 opacity: 0;
-                transition: visibility 300ms linear, opacity 300ms linear;
-                transition-delay: 0.8s;
+                transition: opacity 300ms linear, visibility 0s linear 300ms;
                 pointer-events: none;
                 z-index: 4;
             }
@@ -1475,7 +2108,7 @@ class WebRTCbabycam extends HTMLElement {
             .show {
                 visibility: visible;
                 opacity: 1;
-                transition: visibility 0ms ease-in-out 0ms, opacity 300ms !important;
+                transition: opacity 300ms linear, visibility 0s linear 0s !important;
             }
             .log {
                 color: #ffffff;
@@ -1732,6 +2365,42 @@ class WebRTCbabycam extends HTMLElement {
         `);
     }
 
+    renderAspectRatio(aspectRatio) {
+        if (!aspectRatio) return;
+        const card = this.shadowRoot.querySelector('.card');
+        if (!card) return;
+
+        // Accept "16/9" | "16 / 9" | "16:9" | a number; restrict to safe chars before injecting.
+        const ar = String(aspectRatio).replace(':', '/').trim();
+        if (!/^[\d.\s/]+$/.test(ar)) return;
+
+        // Force a fixed card aspect ratio, fitting the width and cropping the height symmetrically
+        // from the center. Uses the CSS `aspect-ratio` property (height derived from width) with
+        // `height: auto` so the ratio governs instead of the base `ha-card { height: 100% }`.
+        // NOTE: deliberately NOT the padding-bottom-% technique — padding is an animatable length,
+        // so when it resolves it animates ("slides in from the top") under any ancestor that
+        // transitions padding/all. `height: auto` isn't transitionable, so this never slides.
+        // Injected before the user `style:` block so a user can still override (object-position etc).
+        card.insertAdjacentHTML('beforebegin', `
+        <style>
+            ha-card {
+                aspect-ratio: ${ar};
+                height: auto !important;
+                min-height: 0;
+            }
+            video, .image {
+                position: absolute !important;
+                inset: 0 !important;
+                width: 100% !important;
+                height: 100% !important;
+                margin: 0 !important;
+                object-fit: cover;
+                object-position: center;
+            }
+        </style>
+        `);
+    }
+
     renderStyle(userCardStyle) {
         if (!userCardStyle) return;
         const style = document.createElement('style');
@@ -1745,14 +2414,23 @@ class WebRTCbabycam extends HTMLElement {
             return;
 
         const handleKeyUp = (ev) => {
-            const unmute = "KeyT";
+            const mute = "KeyT";
             const debug = "KeyD";
             const stats = "KeyS";
 
             if (!ev.shiftKey) return;
 
+            // Ignore keystrokes typed into editable elements. At document level the event
+            // target is retargeted to the outer shadow host, so composedPath()[0] is the
+            // only way to see the real origin inside HA's nested shadow DOM.
+            const origin = ev.composedPath?.()[0];
+            if (origin && (origin.isContentEditable
+                || origin.tagName === 'INPUT'
+                || origin.tagName === 'TEXTAREA'
+                || origin.tagName === 'SELECT')) return;
+
             switch (ev.code) {
-                case unmute:
+                case mute:
                     WebRTCsession.toggleGlobalMute();
                     break;
                 case debug:
@@ -1764,10 +2442,12 @@ class WebRTCbabycam extends HTMLElement {
             }
         };
         document.addEventListener('keyup', handleKeyUp, true);
+        // Activation-granting events only: 'touchstart' grants NO user activation (it
+        // arrives at touchend), so unmuting from it gets blocked and latches unmute off.
         document.addEventListener('keydown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
         document.addEventListener('mousedown', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
-        document.addEventListener('touchstart', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
-        
+        document.addEventListener('touchend', ev => WebRTCsession.enableUnmute(), { once: true, capture: false });
+
         WebRTCbabycam.initialStaticSetupComplete = true;
     }
 
@@ -1786,9 +2466,19 @@ class WebRTCbabycam extends HTMLElement {
                 this.setPTZVisibility(true);
         });
 
-        if (document.fullscreenEnabled) {
+        if (document.fullscreenEnabled || document.webkitFullscreenEnabled) {
             this.onDoubleTap(container, () => this.toggleFullScreen());
             this.onMouseDoubleClick(container, () => this.toggleFullScreen());
+        }
+        else if (this.config.video !== false && typeof this.media?.webkitEnterFullscreen === 'function') {
+            // iPhone Safari / iOS WebView: no element fullscreen API exists, but WebKit
+            // provides native video-only fullscreen. Exit is signaled by
+            // 'webkitendfullscreen', not document.fullscreenElement, so the
+            // fullscreen:'video' config upgrade path deliberately does not apply here.
+            this.onDoubleTap(container, () => {
+                try { this.media.webkitEnterFullscreen(); }
+                catch (err) { this.trace(`fullscreen: ${err.message}`); }
+            });
         }
 
         if (this.config.video === true) {
@@ -1797,7 +2487,10 @@ class WebRTCbabycam extends HTMLElement {
         }
 
         if (image) {
-            image.addEventListener('click', () => this.session?.fetchImage());
+            image.addEventListener('click', () => {
+                this.session?.noteInterest?.();
+                this.session?.fetchImage();
+            });
             this.onMouseDownHold(image, () => this.session?.fetchImage(), 800, 1000);
             this.onTouchHold(image, () => this.session?.fetchImage(), 800, 1000);
         }
@@ -1843,12 +2536,24 @@ class WebRTCbabycam extends HTMLElement {
                 break;
             case 'background':
                 if (!ev.detail.background) {
-                    this.releaseOtherBackgroundCards();
+                    if (!this.isVisibleInViewport && this.session?.state?.backgroundCard === this) {
+                        // This card is the hidden designee: unwind itself (detach + unload).
+                        // Releasing only OTHER cards left the sole hidden holder streaming
+                        // forever after background mode was disabled.
+                        this.applyVisibility(false, false);
+                    } else {
+                        this.session?.releaseBackground();
+                    }
                 }
                 this.refreshVolume();
+                this.refreshState();
                 break;
             case 'heartbeat':
-                this.live(ev.detail.live && this.isPlaying);
+                // Renew only; never force the dot off here. It fades on its own when renewals
+                // stop (stream dead), and is cleared explicitly on stall/pause/stop/unload.
+                if (ev.detail.live && this.isPlayingActive) {
+                    this.live(true);
+                }
                 this.refreshState();
                 this.refreshVolume();
                 break;
@@ -1878,6 +2583,12 @@ class WebRTCbabycam extends HTMLElement {
                     if (this.media?.classList.contains('unmute-pending')) {
                         this.unmuteMedia();
                     }
+                } else if (this.media && !this.media.muted) {
+                    // Unmute was globally disabled (autoplay blocked on some card). Keep every
+                    // card consistent: re-mute and remember the intent to unmute on next gesture,
+                    // rather than leaving cards audibly unmuted while the global flag says false.
+                    this.muteMedia();
+                    this.media.classList.add('unmute-pending');
                 }
                 break;
             case 'connected':
@@ -1897,33 +2608,81 @@ class WebRTCbabycam extends HTMLElement {
         ev.stopImmediatePropagation();
     }
 
+    /**
+     * Marks that a hold just fired on `element`, so the click synthesized at release is
+     * swallowed. An expiring timestamp + permanent capture guard replaces the old
+     * add/remove of a shared stopImmediatePropagation listener, which could not suppress
+     * earlier-registered listeners, let one input path deregister the other's pending
+     * suppressor, and lingered forever on engines that never deliver the compat click.
+     */
+    markHoldFired(element) {
+        this._holdSuppressUntil.set(element, Date.now() + 700);
+        // Card-scoped stamp: the double-click/double-tap detectors live on the CONTAINER
+        // while holds also fire on descendants (image, PTZ buttons); capture-phase order
+        // means the container detector runs before the descendant's guard can consume.
+        this._lastHoldFireDate = Date.now();
+    }
+
+    holdJustFired(element, consume = true) {
+        const until = this._holdSuppressUntil.get(element) ?? 0;
+        if (Date.now() >= until) return false;
+        if (consume) this._holdSuppressUntil.set(element, 0);
+        return true;
+    }
+
+    installHoldClickGuard(element) {
+        if (this._holdGuarded.has(element)) return;
+        this._holdGuarded.add(element);
+        element.addEventListener('click', (ev) => {
+            if (this.holdJustFired(element)) {
+                ev.stopImmediatePropagation();
+                ev.preventDefault();
+            }
+        }, true);
+    }
+
     onMouseDownHold(element, callback, ms = 500, repeatDelay = undefined) {
-        const attribute = 'data-mousedown';
-        const cancel = (ev) => {
-            const timer = Number(element.getAttribute(attribute));
-            element.removeAttribute(attribute);
-            clearTimeout(timer);
+        this.installHoldClickGuard(element);
+        let pressGen = 0;
+        let fired = false;
+        // The click to suppress is synthesized at RELEASE, which on a long hold can be
+        // well past the fire-time stamp's window - re-stamp at cancel when the hold fired.
+        const cancel = () => {
+            if (fired) {
+                this.markHoldFired(element);
+                fired = false;
+            }
+            pressGen++;
         };
 
         element.addEventListener('mousedown', ev => {
             if (ev.button != 0) return;
-            element.removeEventListener('click', this.stopImmediatePropagation, { capture: true, once: true });
-            if (element.hasAttribute(attribute)) cancel();
+            pressGen++;
+            fired = false;
+            const myPress = pressGen;
+            const myGen = this._interactionGen;
+            // Bound the repeat loop by per-press AND per-render generations plus DOM
+            // connection - a stale loop suspended in its delay can neither be revived by a
+            // re-press nor survive a shadow-DOM rebuild issuing service calls forever.
+            const live = () => myPress === pressGen
+                && myGen === this._interactionGen
+                && element.isConnected;
 
-            const timer = setTimeout(async () => {
-                element.addEventListener('click', this.stopImmediatePropagation, { capture: true, once: true });
+            setTimeout(async () => {
+                if (!live()) return;
+                fired = true;
+                this.markHoldFired(element);
                 if (repeatDelay) {
-                    while (element.hasAttribute(attribute)) {
+                    while (live()) {
+                        this.markHoldFired(element);
                         callback();
                         await new Promise(resolve => setTimeout(resolve, repeatDelay));
                     }
                 }
                 else {
-                    element.removeAttribute(attribute);
                     callback();
                 }
             }, ms);
-            element.setAttribute(attribute, timer);
         });
 
         element.addEventListener('mouseup', cancel);
@@ -1931,33 +2690,42 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     onTouchHold(element, callback, ms = 500, repeatDelay = undefined) {
-        const attribute = 'data-hold';
+        this.installHoldClickGuard(element);
+        let pressGen = 0;
+        let fired = false;
         const cancel = () => {
-            const timer = Number(element.getAttribute(attribute));
-            element.removeAttribute(attribute);
-            clearTimeout(timer);
-        };
-        element.addEventListener('touchstart', (ev) => {
-            element.removeEventListener('click', this.stopImmediatePropagation, { capture: true, once: true });
-            if (element.hasAttribute(attribute)) cancel();
-            if (ev.touches.length > 1) {
-                cancel();
-                return;
+            if (fired) {
+                this.markHoldFired(element);
+                fired = false;
             }
-            const timer = setTimeout(async () => {
-                element.addEventListener('click', this.stopImmediatePropagation, { capture: true, once: true });
+            pressGen++;
+        };
+
+        element.addEventListener('touchstart', (ev) => {
+            pressGen++;
+            fired = false;
+            if (ev.touches.length > 1) return;
+            const myPress = pressGen;
+            const myGen = this._interactionGen;
+            const live = () => myPress === pressGen
+                && myGen === this._interactionGen
+                && element.isConnected;
+
+            setTimeout(async () => {
+                if (!live()) return;
+                fired = true;
+                this.markHoldFired(element);
                 if (repeatDelay) {
-                    while (element.hasAttribute(attribute)) {
+                    while (live()) {
+                        this.markHoldFired(element);
                         callback();
                         await new Promise(resolve => setTimeout(resolve, repeatDelay));
                     }
                 }
                 else {
-                    element.removeAttribute(attribute);
                     callback();
                 }
             }, ms);
-            element.setAttribute(attribute, timer);
         }, { passive: true });
 
         element.addEventListener('touchend', cancel);
@@ -1965,49 +2733,54 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     onDoubleTap(element, doubleTapCallback, ms = 500) {
-        const attribute = 'data-doubletap';
-        const cancel = () => {
-            const timer = Number(element.getAttribute(attribute));
-            element.removeAttribute(attribute);
-            clearTimeout(timer);
-        };
+        let lastTapDate = 0;
         element.addEventListener('touchend', (ev) => {
             if (ev.touches.length > 0) {
-                cancel();
+                lastTapDate = 0;
                 return;
             }
-            if (element.hasAttribute(attribute)) {
+            // The release of a completed hold - on THIS element or any descendant of this
+            // card (image, PTZ) - is not the first tap of a double-tap.
+            if (this.holdJustFired(element, false) || Date.now() - this._lastHoldFireDate < 700) {
+                lastTapDate = 0;
+                return;
+            }
+            const now = Date.now();
+            if (now - lastTapDate < ms) {
+                lastTapDate = 0;
                 if (doubleTapCallback) {
                     ev.preventDefault();
                     doubleTapCallback();
                 }
-                cancel();
                 return;
             }
-            const timer = setTimeout(() => cancel(), ms);
-            element.setAttribute(attribute, timer);
+            lastTapDate = now;
         }, true);
     }
 
     onMouseDoubleClick(element, doubleClickCallback, ms = 500) {
-        const attribute = 'data-doubleclick';
-        const cancel = () => {
-            const timer = Number(element.getAttribute(attribute));
-            element.removeAttribute(attribute);
-            clearTimeout(timer);
-        };
+        let lastClickDate = 0;
         element.addEventListener('click', ev => {
-            if (ev.pointerType !== "mouse" || ev.button !== 0) return;
-            if (element.hasAttribute(attribute)) {
+            if ('pointerType' in ev && ev.pointerType && ev.pointerType !== "mouse") return;
+            if (ev.button !== undefined && ev.button !== 0) return;
+            // This capture listener registers before the hold guard, so it must consult
+            // the hold state itself: hold-then-quick-tap must not trigger fullscreen. The
+            // card-scoped stamp also covers holds on DESCENDANTS (image/PTZ), whose own
+            // guards run after this container-level capture listener.
+            if (this.holdJustFired(element, false) || Date.now() - this._lastHoldFireDate < 700) {
+                lastClickDate = 0;
+                return;
+            }
+            const now = Date.now();
+            if (now - lastClickDate < ms) {
+                lastClickDate = 0;
                 if (doubleClickCallback) {
                     this.stopImmediatePropagation(ev);
                     doubleClickCallback();
                 }
-                cancel();
                 return;
             }
-            const timer = setTimeout(() => cancel(), ms);
-            element.setAttribute(attribute, timer);
+            lastClickDate = now;
         }, true);
     }
 
@@ -2076,8 +2849,14 @@ class WebRTCbabycam extends HTMLElement {
 
         const currentIcon = stateIcon.getAttribute('icon');
         if (icon !== undefined && icon != currentIcon) {
-            stateIcon.icon = icon;
-            stateIcon.setAttribute('icon', icon);
+            if (icon == null) {
+                stateIcon.icon = '';
+                stateIcon.removeAttribute('icon');
+            }
+            else {
+                stateIcon.icon = icon;
+                stateIcon.setAttribute('icon', icon);
+            }
 
             if (icon === 'mdi:loading') {
                 // Synchronize the spin animation based on current time
@@ -2090,6 +2869,12 @@ class WebRTCbabycam extends HTMLElement {
                 stateIcon.style.animationDuration = '1s';
                 stateIcon.style.animationTimingFunction = 'linear'; 
                 stateIcon.style.animationIterationCount = 'infinite';
+            }
+            else {
+                stateIcon.style.animationDelay = '';
+                stateIcon.style.animationDuration = '';
+                stateIcon.style.animationTimingFunction = '';
+                stateIcon.style.animationIterationCount = '';
             }
         }
 
@@ -2111,11 +2896,243 @@ class WebRTCbabycam extends HTMLElement {
         const playing = media && (media.getAttribute('playing') === 'audiovideo' || media.getAttribute('playing') === 'video');
         return playing;
     }
+
+    get isMediaStale() {
+        const media = this.media;
+        return !!(media && media.hasAttribute('stale'));
+    }
+
+    get isPlayingActive() {
+        return this.isPlaying && !this.isMediaStale;
+    }
+
+    get isPlayingVideoActive() {
+        return this.isPlayingVideo && !this.isMediaStale;
+    }
  
     get isPaused() {
         const media = this.media;
         const paused = media && media.getAttribute('playing') === 'paused';
         return paused;
+    }
+
+    clearRefreshStateTimer() {
+        clearTimeout(this.refreshStateTimeoutId);
+        this.refreshStateTimeoutId = undefined;
+    }
+
+    scheduleRefreshState(ms = WebRTCsession.RENDERING_TIMEOUT_MS) {
+        this.clearRefreshStateTimer();
+        this.refreshStateTimeoutId = setTimeout(() => {
+            this.refreshStateTimeoutId = undefined;
+            this.refreshState();
+        }, Math.max(0, ms));
+    }
+
+    stopVideoFrameMonitor() {
+        const media = this.media;
+        if (media && this.videoFrameCallbackId != null && typeof media.cancelVideoFrameCallback === 'function') {
+            try { media.cancelVideoFrameCallback(this.videoFrameCallbackId); } catch { }
+        }
+        this.videoFrameCallbackId = undefined;
+        clearTimeout(this.mediaStaleTimeoutId);
+        this.mediaStaleTimeoutId = undefined;
+        clearTimeout(this.videoFramePollTimeoutId);
+        this.videoFramePollTimeoutId = undefined;
+        this.lastMediaActivityDate = 0;
+        this.lastActivitySample = null; // rebase the stats fallback baseline (frames/samples) on (re)start
+    }
+
+    scheduleVideoFrameMonitor(immediate = false) {
+        const { media } = this;
+        const srcObject = media?.srcObject;
+        const hasVideo = !!srcObject?.getVideoTracks?.().length;
+        const hasAudio = !!srcObject?.getAudioTracks?.().length;
+        if (!media || (!hasVideo && !hasAudio)) {
+            return;
+        }
+
+        // Self-sustaining poll: re-armed every interval whether or not requestVideoFrameCallback
+        // fires, so the monitor can never stall on engines that don't deliver rVFC for a MediaStream.
+        if (this.videoFramePollTimeoutId != null) {
+            return;
+        }
+
+        const delay = immediate ? 0 : Math.min(
+            WebRTCsession.VIDEO_FRAME_POLL_INTERVAL_MS,
+            Math.max(250, Math.floor(this.config.image_expiry / 4))
+        );
+        this.videoFramePollTimeoutId = setTimeout(async () => {
+            this.videoFramePollTimeoutId = undefined;
+            if (!this.isPlaying) return;
+
+            const video = !!media.srcObject?.getVideoTracks?.().length;
+            if (video) {
+                const rvfcSupported = typeof media.requestVideoFrameCallback === 'function';
+                // A still-pending rVFC means it didn't fire last interval — the engine isn't
+                // delivering presented-frame callbacks for this MediaStream (iOS Safari + WebRTC).
+                const rvfcNotFiring = rvfcSupported && this.videoFrameCallbackId != null;
+
+                // Preferred signal: rVFC fires when a frame is actually PRESENTED — true proof the
+                // image isn't frozen, at zero polling cost. This is the indicator's intended driver.
+                if (rvfcSupported && this.videoFrameCallbackId == null) {
+                    try {
+                        this.videoFrameCallbackId = media.requestVideoFrameCallback(() => {
+                            this.videoFrameCallbackId = undefined;
+                            this.noteMediaActivity();
+                        });
+                    } catch {
+                        this.videoFrameCallbackId = undefined;
+                    }
+                }
+
+                // Fallback ONLY where rVFC can't deliver: decoded video-frame count advancing.
+                // Engines with a working rVFC never reach this, so playback is NEVER slowed.
+                if (!rvfcSupported || rvfcNotFiring) {
+                    await this.noteMediaActivityFromStats(true);
+                }
+            }
+            else {
+                // Audio-only edge case: no rendered frames, so "not frozen" becomes "audio is still
+                // flowing" — received samples advancing. Less critical, and there's no image to slow.
+                await this.noteMediaActivityFromStats(false);
+            }
+
+            this.scheduleVideoFrameMonitor();
+        }, delay);
+    }
+
+    // Stats-based liveness, used only where the cheap per-frame / timeupdate signals don't fire
+    // (notably iOS Safari + WebRTC). video=true → decoded video frames advancing (image not frozen);
+    // video=false → received audio samples advancing (audio still flowing).
+    async noteMediaActivityFromStats(video) {
+        const pc = this.session?.activeCall?.peerConnection;
+        if (!pc) return;
+        let sample = 0;
+        try {
+            const stats = await pc.getStats(null);
+            stats.forEach(report => {
+                if (report.type !== 'inbound-rtp') return;
+                // CRITICAL for Safari: it does NOT populate report.kind on inbound-rtp — it uses the
+                // legacy 'mediaType', or neither. A `report.kind === 'video'` filter matches ZERO
+                // reports on Safari, which is why the dot died there. Select by kind||mediaType, then
+                // fall back to the stat shape: only video inbound-rtp carries framesDecoded.
+                const kind = report.kind || report.mediaType
+                    || (typeof report.framesDecoded === 'number' ? 'video' : 'audio');
+                if (video && kind === 'video') {
+                    sample += report.framesDecoded || 0;
+                }
+                else if (!video && kind === 'audio') {
+                    // Receipt-based counters only: totalSamplesReceived INCLUDES concealed
+                    // samples, which NetEq keeps synthesizing at the sample rate during a
+                    // total RTP outage - a dead stream would look alive forever. Prefer
+                    // packetsReceived (plateaus on outage, like framesDecoded for video),
+                    // and only fall back to concealment-corrected samples.
+                    sample += report.packetsReceived
+                        ?? report.bytesReceived
+                        ?? ((report.totalSamplesReceived != null)
+                            ? report.totalSamplesReceived - (report.concealedSamples ?? 0)
+                            : 0);
+                }
+            });
+        } catch {
+            return;
+        }
+        const prev = this.lastActivitySample;
+        this.lastActivitySample = sample;
+        // Renew when the counter advances — and on the FIRST positive sample (a non-zero
+        // framesDecoded / samples count already proves media is being produced, so we don't waste a
+        // whole poll cycle just establishing a baseline). A counter reset on reconnect (sample < prev)
+        // just rebases without a false renewal. A frozen/dead stream stops advancing → dot fades.
+        if (sample > 0 && (prev == null || sample > prev)) {
+            this.noteMediaActivity();
+            if (prev == null) this.trace(`Live via stats fallback (${video ? 'framesDecoded' : 'audio packets'}=${sample})`);
+        }
+    }
+
+    scheduleMediaStaleCheck() {
+        if (this.mediaStaleTimeoutId != null) return;
+
+        const delay = Math.max(0, (this.lastMediaActivityDate + this.config.image_expiry) - Date.now());
+        this.mediaStaleTimeoutId = setTimeout(() => {
+            this.mediaStaleTimeoutId = undefined;
+            const remaining = (this.lastMediaActivityDate + this.config.image_expiry) - Date.now();
+            if (remaining > 0) {
+                this.scheduleMediaStaleCheck();
+                return;
+            }
+            this.setMediaStale(true);
+        }, delay);
+    }
+
+    scheduleMediaStale(graceMs = WebRTCsession.MEDIA_STALE_GRACE_MS) {
+        if (this.staleDebounceTimeoutId != null) return;
+        const { media } = this;
+        if (!media || media.hasAttribute('stale')) return;
+        this.staleDebounceTimeoutId = setTimeout(() => {
+            this.staleDebounceTimeoutId = undefined;
+            this.setMediaStale(true, false);
+        }, Math.max(0, graceMs));
+    }
+
+    setMediaStale(stale = true, deferVideo = stale) {
+        const { media, session } = this;
+        if (!media) return;
+
+        // Any explicit stale decision (true now, or activity clearing it) supersedes a pending
+        // debounce. noteMediaActivity -> setMediaStale(false) is what cancels a transient blur.
+        clearTimeout(this.staleDebounceTimeoutId);
+        this.staleDebounceTimeoutId = undefined;
+
+        if (stale) {
+            clearTimeout(this.mediaStaleTimeoutId);
+            this.mediaStaleTimeoutId = undefined;
+            if (!media.hasAttribute('stale')) {
+                media.setAttribute('stale', '');
+            }
+            this.live(false);
+            this.refreshState();
+            if (session?.state?.cards?.has(this) && deferVideo && this.isPlayingVideo) {
+                session.deferVideo?.('stale video', WebRTCsession.RENDERING_TIMEOUT_MS);
+            }
+            if (session?.state?.cards?.has(this) && !session.isAnyCardPlayingVideo) {
+                session.fetchImage(0);
+            }
+            return;
+        }
+
+        media.removeAttribute('stale');
+    }
+
+    noteMediaActivity(startFrameMonitor = false) {
+        const { media } = this;
+        if (!media) return;
+
+        this.lastMediaActivityDate = Date.now();
+        const wasStale = media.hasAttribute('stale');
+        this.setMediaStale(false);
+        this.scheduleMediaStaleCheck();
+
+        if (media.srcObject?.getVideoTracks?.().length) {
+            this.session?.relieveVideoPressure?.();
+        }
+
+        // Renew the live indicator on real media activity (rendered frame / timeupdate). This
+        // is the independent confirmation that the stream is producing media — distinct from
+        // the watchdog/ICE-state heartbeat — so the dot tracks actual rendering.
+        if (this.isPlayingActive) {
+            this.live(true);
+        }
+
+        if (wasStale) {
+            this.refreshState();
+        }
+
+        if (!startFrameMonitor) {
+            return;
+        }
+
+        this.scheduleVideoFrameMonitor(true);
     }
 
     refreshState(reset = false) {
@@ -2133,7 +3150,7 @@ class WebRTCbabycam extends HTMLElement {
             return;
         }
 
-        const playing = this.isPlaying;
+        const playing = this.isPlayingActive;
         const paused = this.isPaused;
 
         const waitedTooLong = WebRTCsession.RENDERING_TIMEOUT_MS;
@@ -2141,12 +3158,22 @@ class WebRTCbabycam extends HTMLElement {
         let show = undefined;
         let title = undefined;
 
+        if (session?.isVideoDeferred && session?.state?.image && !session?.activeCall) {
+            this.clearRefreshStateTimer();
+            this.playingWaitStartDate = null;
+            this.header = showStats ? (session?.state?.statistics ?? "") : "";
+            this.setStateIcon(null, false, undefined);
+            return;
+        }
+
         if (reset) {
             this.playingWaitStartDate = Date.now();
             this.setStateIcon(undefined, false, undefined);
-            setTimeout(() => this.refreshState(), waitedTooLong);
+            this.scheduleRefreshState(waitedTooLong);
             return;
         }
+
+        this.clearRefreshStateTimer();
 
         switch (status) {
             case undefined:
@@ -2171,8 +3198,18 @@ class WebRTCbabycam extends HTMLElement {
                 // fall-through
 
             case 'connecting':
-                icon = audioOnly ? "mdi:volume-mute" : "mdi:loading";
+                if (!this.playingWaitStartDate) {
+                    this.playingWaitStartDate = Date.now();
+                }
+                // Don't clobber the 'error' fall-through icon (mdi:alert-circle) with the
+                // loading/volume-mute glyph; the error case relies on reaching setStateIcon.
+                if (status !== 'error') {
+                    icon = audioOnly ? "mdi:volume-mute" : "mdi:loading";
+                }
                 show = show || (Date.now() >= this.playingWaitStartDate + waitedTooLong);
+                if (show !== true) {
+                    this.scheduleRefreshState((this.playingWaitStartDate + waitedTooLong) - Date.now());
+                }
                 this.setStateIcon(icon, show, title);
                 return;
 
@@ -2208,6 +3245,16 @@ class WebRTCbabycam extends HTMLElement {
                 show = true;
             }
         }
+        else {
+            if (!this.playingWaitStartDate) {
+                this.playingWaitStartDate = Date.now();
+            }
+            icon = audioOnly ? "mdi:volume-mute" : "mdi:loading";
+            show = Date.now() >= this.playingWaitStartDate + waitedTooLong;
+            if (show !== true) {
+                this.scheduleRefreshState((this.playingWaitStartDate + waitedTooLong) - Date.now());
+            }
+        }
 
         this.setStateIcon(icon, show, title);
     }
@@ -2218,8 +3265,10 @@ class WebRTCbabycam extends HTMLElement {
 
         const lastHash = image.getAttribute('hash');
         const lastTimestamp = image.getAttribute('timestamp');
-        if (lastTimestamp === data.timestamp) return;
-        if (lastHash && lastHash === data.hash) return;
+        const sameHash = !!(lastHash && data.hash && lastHash === data.hash);
+        // Images currently carry no hash, so fall back to timestamp-only dedup; this skips
+        // the redundant revoke/createObjectURL + animation restart on unchanged re-renders.
+        if (lastTimestamp === String(data.timestamp) && (sameHash || !data.hash)) return;
 
         const lastSize = image.getAttribute('size');
         if (lastSize) {
@@ -2233,9 +3282,16 @@ class WebRTCbabycam extends HTMLElement {
         }
         else {
             image.setAttribute('timestamp', data.timestamp);
-            const animation = image.getAnimations()[0];
-            animation?.cancel();
-            animation?.play();
+            const animation = image.getAnimations?.()[0];
+            if (animation) {
+                animation.cancel();
+                animation.play();
+            }
+            else {
+                image.style.animation = 'none';
+                void image.offsetWidth;
+                image.style.animation = '';
+            }
         }
         
         if (data.hash) {
@@ -2244,11 +3300,11 @@ class WebRTCbabycam extends HTMLElement {
 
         const objUrl = URL.createObjectURL(data.blob);
         image.src = objUrl;
-
-        clearTimeout(this.imageRefreshTimeoutId);
-        this.imageRefreshTimeoutId = setTimeout(() => {
-            try { URL.revokeObjectURL(objUrl); } catch { }
-        }, this.config.image_expiry);
+        // Do NOT revoke this blob on a timer: when images stop arriving (stream stale), that timer
+        // would revoke the URL the <img> is still displaying — blanking it to black instead of
+        // letting the stale image stay shown (blurred). The previous image's URL is already revoked
+        // when a new one replaces it (revoke-on-replace above), so at most one URL is ever held and
+        // the last frame remains valid for as long as it's on screen.
     }
     
     refreshVolume() {
@@ -2331,7 +3387,7 @@ class WebRTCbabycam extends HTMLElement {
         if (session?.tracing === false)
             return;
 
-        text = `${this.instanceId} ${text}`;
+        text = `${this.instanceId} | ${text}`;
         if (session)  {
             session.trace(text, o);
         }
@@ -2350,13 +3406,21 @@ class WebRTCbabycam extends HTMLElement {
         // todo: improve tracing enablement
         if (this.session?.tracing === false) return;
 
-        const log = this.shadowRoot.querySelector('.log');
+        const log = this.shadowRoot?.querySelector('.log');
         if (!log) return;
 
         const max_entries = 1000;
         const min_entries = 500;
 
-        log.insertAdjacentHTML('beforeend', `${this.instanceId} ${message.replace("\n", "<br>")}<br>`);
+        // Escape before injecting: trace messages embed remote-derived strings (server
+        // errors, ICE candidate SDP) that must not be parsed as markup. Also replace ALL
+        // newlines (String.replace with a string target only hits the first occurrence).
+        const escaped = `${this.instanceId} | ${message}`
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/\n/g, '<br>');
+        log.insertAdjacentHTML('beforeend', `${escaped}<br>`);
         if (log.childNodes.length > max_entries) {
             while (log.childNodes.length > min_entries) {
                 log.removeChild(log.firstChild);
@@ -2366,19 +3430,44 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     toggleFullScreen() {
-        if (!document.fullscreenEnabled) return;
+        if (!(document.fullscreenEnabled || document.webkitFullscreenEnabled)) return;
 
         const { session, config } = this;
 
-        if (!document.fullscreenElement) {
-            this.requestFullscreen();
-            if (config.fullscreen === 'video' && session?.config.video === false && config.video === false) {
+        // Mutating the shared session.config.video affects every card on the session, so only
+        // apply the fullscreen video upgrade when this card is the sole consumer, and restore
+        // exactly what we changed (tracked per card) rather than hard-setting false on exit.
+        const fullscreenVideo = config.fullscreen === 'video' && config.video === false && !!session;
+        const soleCard = !!session && session.state.cards.size <= 1;
+
+        // Prefix-aware state test: on webkit-prefixed-only engines (iPadOS/macOS Safari
+        // <= 16.3) document.fullscreenElement is always undefined, which would make the
+        // exit branch unreachable - enter would work but exit never.
+        const fullscreenElement = document.fullscreenElement ?? document.webkitFullscreenElement;
+
+        if (!fullscreenElement) {
+            // requestFullscreen returns a promise with several spec-defined rejection
+            // paths (permissions policy, no transient activation); never leave it unhandled.
+            try {
+                const request = this.requestFullscreen ? this.requestFullscreen() : this.webkitRequestFullscreen?.();
+                request?.catch?.(err => this.trace(`fullscreen: ${err.message}`));
+            } catch (err) {
+                this.trace(`fullscreen: ${err.message}`);
+            }
+            if (fullscreenVideo && soleCard && session.config.video === false) {
+                this._fullscreenVideoOverride = true;
                 session.config.video = true;
                 session.restartCall();
             }
         } else {
-            document.exitFullscreen();
-            if (config.fullscreen === 'video' && session?.config.video === true && config.video === false) {
+            try {
+                const exit = document.exitFullscreen ? document.exitFullscreen() : document.webkitExitFullscreen?.();
+                exit?.catch?.(err => this.trace(`fullscreen: ${err.message}`));
+            } catch (err) {
+                this.trace(`fullscreen: ${err.message}`);
+            }
+            if (fullscreenVideo && this._fullscreenVideoOverride && session.config.video === true) {
+                this._fullscreenVideoOverride = false;
                 session.config.video = false;
                 session.restartCall();
             }
@@ -2415,13 +3504,20 @@ class WebRTCbabycam extends HTMLElement {
             "image_interval": WebRTCsession.IMAGE_FETCH_INTERVAL_MS,
             "image_expiry": WebRTCsession.IMAGE_FETCH_INTERVAL_MS * WebRTCsession.IMAGE_EXPIRY_RETRIES,
             "allow_background": false,
+            "background_muted_grace": WebRTCsession.BACKGROUND_MUTED_GRACE_MS,
+            "background_mute_policy": "park",
+            "background_video": "shed",
+            "background_timeout": 0,
+            "dock": true,
             "allow_mute": true,
             "allow_pause": false,
             "allow_microphone": false,
             "fps": null,
+            "ice_servers": null,
             "ptz": null,
             "style": null,
             "shortcuts": null,
+            "aspect_ratio": null,
             "url_type": "webrtc-babycam"
           };
 
@@ -2432,12 +3528,68 @@ class WebRTCbabycam extends HTMLElement {
             mergedConfig.image_interval = Math.max(33, mergedConfig.image_interval);
         }
 
+        if (mergedConfig.aspect_ratio != null) {
+            // Accept "16/9", "16 / 9", "16:9", or a number; normalize to a CSS aspect-ratio value.
+            mergedConfig.aspect_ratio = String(mergedConfig.aspect_ratio).trim().replace(':', '/');
+        }
+
+        // Normalize/validate ice_servers before it is stored: key() forks the session on
+        // any truthy value while createPeer honors only arrays, so a silently-ignored
+        // malformed value would both discard the user's TURN/STUN config AND split the
+        // session. A single mapping is a forgivable YAML shape; anything else throws.
+        if (mergedConfig.ice_servers != null && !Array.isArray(mergedConfig.ice_servers)) {
+            if (typeof mergedConfig.ice_servers === 'object') {
+                mergedConfig.ice_servers = [mergedConfig.ice_servers];
+            } else {
+                throw new Error("`ice_servers` must be an array of RTCIceServer objects (or [])");
+            }
+        }
+
         if (this._cardConfig) {
+            // Reconfiguration of an already-initialized card. Detach from the current session
+            // FIRST so connectedCallback()'s "already attached" early-return doesn't skip
+            // applying the new config. The new config may change the entity/url/capabilities
+            // (and therefore the session key), so a clean detach + re-render + reattach is
+            // required to bind to the correct session instead of silently keeping the old one.
+            const wasConnected = this.isConnected;
+            const wasHiddenDesignee = this.session?.state?.backgroundCard === this;
+            this.applyVisibility(false, false); // detaches card and clears _cardSession
             this._cardConfig = mergedConfig;
-            this.connectedCallback();
+            // Force a fresh IntersectionObserver on the re-run: an already-observed,
+            // still-intersecting target generates no further records, so without a new
+            // observe() a visible reconfigured card would stay detached (black) forever.
+            this.isVisibleInViewport = false;
+            this._pendingVisibility = null;
+            this.intersectionObserver?.disconnect();
+            this.intersectionObserver = null;
+            if (wasConnected) {
+                this.connectedCallback();
+            }
+            // A hidden background designee must survive reconfiguration: the detach above
+            // dropped the session's only card (starting the 3s termination grace), and
+            // neither the fresh IntersectionObserver (still not intersecting) nor the
+            // proactive connect check (this.session is null now) can re-attach a
+            // non-visible card. Re-arm under the (possibly re-keyed) session: the visible
+            // pass re-registers media handlers and reloads the stream, the immediate
+            // hidden pass hands the card back to designee state; attachCard cancels a
+            // pending same-key termination.
+            if (wasHiddenDesignee && !this.isElementActuallyVisible(this)) {
+                const configClone = JSON.parse(JSON.stringify(this._cardConfig));
+                const session = WebRTCsession.getInstance(configClone);
+                if (session.background) {
+                    this._cardSession = session;
+                    this.applyVisibility(true);
+                    this.applyVisibility(false, true);
+                }
+            }
             return;
         }
         this._cardConfig = mergedConfig;
+
+        if (this.isConnected) {
+            // reuse the same init path as normal attach
+            this.connectedCallback();
+        }
     }
 
     set hass(hass) {
@@ -2447,11 +3599,8 @@ class WebRTCbabycam extends HTMLElement {
 
     releaseOtherBackgroundCards()
     {
-        [...this.session.state.cards].forEach(otherCard => {
-            if (otherCard !== this && otherCard.isVisibleInViewport === false) {
-                otherCard.applyVisibility(false, false);
-            }
-        });
+        // Compat shim: the session now tracks a single designated background card.
+        this.session?.releaseBackground();
     }
 
     applyVisibility(visible, allow_background = undefined) {
@@ -2462,13 +3611,17 @@ class WebRTCbabycam extends HTMLElement {
             'canplay',
             'play',
             'playing',
+            'timeupdate',
+            'waiting',
+            'stalled',
+            'loadedmetadata',
             'volumechange',
             'dblclick',
             'click',
             'error',
         ];
         const media = this.media;
-        
+
         this.trace(`Visibility changed: ${visible}`);
         if (visible) {
 
@@ -2479,30 +3632,63 @@ class WebRTCbabycam extends HTMLElement {
                 this.mediaEventHandlersRegistered = true;
             }
 
-            if (!this.session) {
+            if (!this.session || this.session.isTerminated) {
                 const configClone = JSON.parse(JSON.stringify(this._cardConfig));
                 this._cardSession = WebRTCsession.getInstance(configClone);
             }
 
             const session = this.session;
             session.attachCard(this, this.sessionEvent);
+            session.relieveVideoPressure?.(true);
+            session.unpark?.();
+
+            if (session.activeCall) {
+                // A visible card is proof of interest: after suspension/throttling the
+                // wall-clock deadline may already be stale — extend rather than letting
+                // the next tick tear down a healthy call.
+                session.extendCallTimeout(session.activeCall, WebRTCsession.RENDERING_TIMEOUT_MS);
+
+                if (session.activeCall.videoShed && this.config.video === true) {
+                    // Background call was negotiated audio-only; restore video for viewing.
+                    session.restartCall();
+                }
+            }
 
             if (session.background && this.config.muted !== true)
                 this.unmuteMedia();
-    
+
             this.loadRemoteStream();
-            this.live(this.isPlaying);
+            if (this.isPlaying) {
+                // isPlaying (not isPlayingVideo): an audio-only card returning from the
+                // hidden-designee state keeps playing the same srcObject, so no new
+                // 'playing' event will ever restart the liveness monitor - this is the
+                // only unhide-time restart, and it must cover audio too.
+                this.noteMediaActivity(true);
+            }
+            this.live(this.isPlayingActive);
             this.refreshVolume();
             this.refreshState(true);
             this.refreshMicrophone();
             this.refreshImage(session.state.image);
 
+            BackgroundManager.getInstance().noteCardVisible(session, this);
         }
-        else if (allow_background && this.session?.background)
+        else if (allow_background && this.session?.background && this.session.claimBackground(this))
         {
-            this.releaseOtherBackgroundCards();
+            this.trace(`Holding background stream as designated card`);
+            this.stopVideoFrameMonitor?.();
+            this.setMediaStale?.(false, false);
+
+            const session = this.session;
+            if (session.shouldShedBackgroundVideo && session.activeCall && !session.activeCall.videoShed) {
+                // Renegotiate audio-only: no card renders video while hidden.
+                session.restartCall();
+            }
+            BackgroundManager.getInstance().noteCardHidden(session, this);
         }
         else {
+            this.trace(`Detaching card from session`);
+            const session = this.session;
 
             if (this.mediaEventHandlersRegistered) {
                 mediaEventTypes.forEach(event => {
@@ -2517,29 +3703,41 @@ class WebRTCbabycam extends HTMLElement {
             this.setControlsVisibility(false);
             this.setPTZVisibility(false);
             this.unloadRemoteStream();
+
+            if (session) BackgroundManager.getInstance().noteCardHidden(session, this);
         }
     }
    
     isElementActuallyVisible(element) {
         if (!element.isConnected) {
-            return false; 
+            return false;
         }
-    
+
+        // A page can be loaded already-hidden (opened in a background tab); geometry is
+        // still computed there, so gate on actual page visibility first.
+        if (document.visibilityState !== 'visible') {
+            return false;
+        }
+
         const style = window.getComputedStyle(element);
         if (style.display === 'none' || style.visibility === 'hidden' || parseFloat(style.opacity) === 0) {
-            return false; 
+            return false;
         }
-    
+
         const rect = element.getBoundingClientRect();
-    
+        if (rect.width === 0 || rect.height === 0) {
+            return false;
+        }
+
         const pointsToCheck = [
-            { x: rect.left, y: rect.top },
-            { x: rect.right, y: rect.top },
-            { x: rect.left, y: rect.bottom },
-            { x: rect.right, y: rect.bottom },
+            { x: rect.left + 1, y: rect.top + 1 },
+            { x: rect.right - 1, y: rect.top + 1 },
+            { x: rect.left + 1, y: rect.bottom - 1 },
+            { x: rect.right - 1, y: rect.bottom - 1 },
+            { x: (rect.left + rect.right) / 2, y: (rect.top + rect.bottom) / 2 },
         ];
-    
-        // Check if any corner is visible
+
+        // Check if any probe point hits this card
         for (const point of pointsToCheck) {
             if (
                 point.x >= 0 &&
@@ -2547,13 +3745,22 @@ class WebRTCbabycam extends HTMLElement {
                 point.x <= (window.innerWidth || document.documentElement.clientWidth) &&
                 point.y <= (window.innerHeight || document.documentElement.clientHeight)
             ) {
-                const elementAtPoint = document.elementFromPoint(point.x, point.y);
-                if (elementAtPoint === element || element.contains(elementAtPoint)) {
-                    return true; 
+                // document.elementFromPoint retargets hits inside shadow trees to the
+                // outermost shadow host, so inside HA's nested shadow DOM it can never
+                // return this card directly. Descend open shadow roots to reach the real
+                // hit, then test containment along the composed (shadow-including) tree.
+                let hit = document.elementFromPoint(point.x, point.y);
+                while (hit && hit.shadowRoot) {
+                    const deeper = hit.shadowRoot.elementFromPoint(point.x, point.y);
+                    if (!deeper || deeper === hit) break;
+                    hit = deeper;
+                }
+                for (let node = hit; node; node = node.parentNode ?? node.host) {
+                    if (node === element) return true;
                 }
             }
         }
-    
+
         return false;
     }
     
@@ -2572,14 +3779,37 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     intersectionObserverCallback(entries) {
-        const isIntersecting = entries[entries.length - 1].isIntersecting;
+        // Treat a hidden page as not-visible so a dashboard opened in a background tab
+        // doesn't attach and stream A/V unseen; visibilitychange re-evaluates on show.
+        const isIntersecting = entries[entries.length - 1].isIntersecting
+            && document.visibilityState === 'visible';
         if (this.isVisibleInViewport !== isIntersecting) {
-            this.isVisibleInViewport = isIntersecting
-            if (document.fullscreenElement) return;
-
+            if (document.fullscreenElement && !isIntersecting) {
+                // Defer HIDING while any fullscreen is active (IO reports non-intersection
+                // for cards behind the fullscreen surface). Do not mutate the flag here:
+                // the pending value is committed on fullscreenchange, otherwise the
+                // transition is permanently swallowed (records only fire on crossings).
+                this._pendingVisibility = isIntersecting;
+                return;
+            }
+            this._pendingVisibility = null;
+            this.isVisibleInViewport = isIntersecting;
             this.applyVisibility(this.isVisibleInViewport, this.session?.background);
         }
     };
+
+    fullscreenChanged() {
+        if (document.fullscreenElement) return;
+        const pending = this._pendingVisibility;
+        this._pendingVisibility = null;
+        if (pending == null || this.isVisibleInViewport === pending) return;
+        // A deferred hide can be stale by exit time (layout moved during fullscreen with no
+        // further IO record to correct it); committing it would detach an on-screen card
+        // with nothing left to re-attach it. Verify geometrically before acting.
+        if (pending === false && this.isElementActuallyVisible(this)) return;
+        this.isVisibleInViewport = pending;
+        this.applyVisibility(pending, this.session?.background);
+    }
 
     setupVisibilityAndResizeHandlers() {
 
@@ -2596,7 +3826,8 @@ class WebRTCbabycam extends HTMLElement {
                 const ptzHeight = Number(ptzStyle.getPropertyValue("--ptz-height").replace('px', ''));
                 const resize = new ResizeObserver(entries => {
                     for (const entry of entries) {
-                        const { inlineSize: width, blockSize: availableheight } = entry.contentBoxSize[0];
+                        const boxSize = Array.isArray(entry.contentBoxSize) ? entry.contentBoxSize[0] : entry.contentBoxSize;
+                        const availableheight = boxSize?.blockSize ?? entry.contentRect?.height ?? 0;
                         if (availableheight > 0) {
                             let scale;
                             if (ptzHeight > availableheight)
@@ -2616,6 +3847,7 @@ class WebRTCbabycam extends HTMLElement {
 
         if (this.documentVisibilityListener) return;
         document.addEventListener("visibilitychange", this.documentVisibility);
+        document.addEventListener("fullscreenchange", this.fullscreenChanged);
         this.documentVisibilityListener = true;
     }
 
@@ -2629,7 +3861,8 @@ class WebRTCbabycam extends HTMLElement {
 
         if (!this.documentVisibilityListener) return;
         document.removeEventListener("visibilitychange", this.documentVisibility);
-        this.documentVisibilityListener = false; 
+        document.removeEventListener("fullscreenchange", this.fullscreenChanged);
+        this.documentVisibilityListener = false;
     }
 
     /** 
@@ -2638,12 +3871,30 @@ class WebRTCbabycam extends HTMLElement {
     render() {
 
         this.rendered = false;
+        this._interactionGen++;   // terminate hold-repeat loops bound to the old subtree
+
+        // Release resources bound to the shadow DOM we are about to destroy, so they do not
+        // leak across a re-render: the current snapshot object URL (whose deferred-revoke
+        // timer we would otherwise clobber), and the ResizeObserver (which would keep the
+        // detached .media-container alive AND stop observing the freshly-built one — silently
+        // breaking PTZ auto-scaling). setupVisibilityAndResizeHandlers() re-creates the
+        // observer on the new container right after render().
+        if (this.shadowRoot) {
+            const oldImage = this.shadowRoot.querySelector('.image');
+            if (oldImage && oldImage.src && oldImage.src.startsWith('blob:')) {
+                try { URL.revokeObjectURL(oldImage.src); } catch { }
+            }
+            clearTimeout(this.imageRefreshTimeoutId);
+            this.imageRefreshTimeoutId = undefined;
+            this.resizeObserver?.disconnect();
+            this.resizeObserver = null;
+        }
 
         if (this.shadowRoot) {
             while (this.shadowRoot.firstChild) {
                 this.shadowRoot.removeChild(this.shadowRoot.firstChild);
             }
-        } 
+        }
         else {
             this.attachShadow({ mode: 'open' });
         }
@@ -2665,6 +3916,7 @@ class WebRTCbabycam extends HTMLElement {
             this.renderContainer(muted, config.image_expiry);
             this.renderPTZ(hasMove, hasZoom, hasHome, hasVol, hasMic);
             this.renderShortcuts(shortcuts);
+            this.renderAspectRatio(config.aspect_ratio);
             this.renderStyle(userCardStyle);
             this.renderInteractionEventListeners();
             this.rendered = true;
@@ -2673,6 +3925,14 @@ class WebRTCbabycam extends HTMLElement {
 
     connectedCallback() {
         WebRTCbabycam.globalInit();
+
+        // Cancel a pending deferred teardown: a same-tick disconnect+connect is a DOM
+        // MOVE (HA edit-mode reorder, browser_mod popup hoist), not a removal.
+        clearTimeout(this._pendingDetachId);
+        this._pendingDetachId = undefined;
+
+        // If we were attached before configuration, wait until config to exist
+         if (!this._cardConfig) return;
 
         if (this.session?.state?.cards?.has(this)) {
             // card running in the background
@@ -2683,7 +3943,23 @@ class WebRTCbabycam extends HTMLElement {
         this.render();
         this.setupVisibilityAndResizeHandlers();
 
-        setTimeout(() => {
+        clearTimeout(this.connectTimeoutId);
+        this.connectTimeoutId = setTimeout(() => {
+            this.connectTimeoutId = undefined;
+            // Proactively evaluate visibility on mount and attach if the card is actually on
+            // screen. Otherwise the card only ever attaches from an IntersectionObserver
+            // callback, which can be delayed or suppressed (e.g. the fullscreenElement guard, or
+            // dialog timing) inside a browser_mod popup / fullscreen kiosk — leaving it black
+            // because it never connects. Off-screen dashboard cards still report not-visible here.
+            if (!this.session?.state?.cards?.has(this)) {
+                const actuallyVisible = this.isElementActuallyVisible(this);
+                if (actuallyVisible || this.session?.background) {
+                    // Only commit the flag when acting on it; unconditional overwrites here
+                    // raced with (and swallowed) the IntersectionObserver's initial record.
+                    this.isVisibleInViewport = actuallyVisible;
+                    this.applyVisibility(actuallyVisible, this.session?.background);
+                }
+            }
             this.setControlsVisibility(false);
             this.setPTZVisibility(false);
             this.setDebugVisibility(WebRTCsession.globalDebug || (this.config.debug && WebRTCsession.globalDebug !== false));
@@ -2691,33 +3967,71 @@ class WebRTCbabycam extends HTMLElement {
     }
 
     disconnectedCallback() {
-        this.removeVisibilityAndResizeHandlers();
-        this.isVisibleInViewport = false;
-        this.applyVisibility(false, this.session?.background);
+        clearTimeout(this.connectTimeoutId);
+        this.connectTimeoutId = undefined;
+        this._interactionGen++;   // hold-repeat loops must not survive the DOM
+
+        // Defer the teardown one task: the custom-element contract fires disconnected +
+        // connected back-to-back for a synchronous move, and tearing down immediately
+        // guarantees a black flash, a destructive shadow rebuild, and media state loss on
+        // every reparent. A real removal runs the teardown one task later - still far
+        // inside the session's 3s termination grace.
+        clearTimeout(this._pendingDetachId);
+        this._pendingDetachId = setTimeout(() => {
+            this._pendingDetachId = undefined;
+            if (this.isConnected) return;          // it was a move; connectedCallback kept state
+
+            this.removeVisibilityAndResizeHandlers();
+            this.isVisibleInViewport = false;
+            this.applyVisibility(false, this.session?.background);
+
+            // Release the final snapshot's object URL - blob URLs pin their Blob for the
+            // document's lifetime otherwise - unless this card stayed attached as the
+            // hidden background designee (its <img> must remain valid).
+            if (!this.session?.state?.cards?.has(this)) {
+                const img = this.shadowRoot?.querySelector('.image');
+                if (img?.src?.startsWith('blob:')) {
+                    try { URL.revokeObjectURL(img.src); } catch { }
+                    img.removeAttribute('size');
+                    img.removeAttribute('timestamp');
+                    img.removeAttribute('hash');
+                    img.removeAttribute('src');
+                }
+            }
+        }, 0);
     }
 
     loadRemoteStream() {
         const { media } = this;
+
         const remoteStream = this.session?.activeCall?.remoteStream;
-        
         if (!remoteStream) return;
+        const same = media.srcObject === remoteStream;
 
-        if (media.srcObject === remoteStream) {
-            this.trace("Reloading remote media stream");
-        }
-        else {
+        if (same) {
+            this.trace("Ignoring request to reload media stream");
+        } else {
             this.trace("Loading remote media stream");
-            media.setAttribute('loaded', Date.now());
+            this.playGen++;
             media.srcObject = remoteStream;
+            media.setAttribute('loaded', Date.now());
         }
 
-        if (this.session?.isStreaming && !this.isPlaying) {
-            this.playMedia();
+        if (this.session?.isStreaming && !this.isPlayingActive) {
+           this.playMedia();
         }
+      
     }
 
     unloadRemoteStream() {
         const { media } = this;
+        if (!media) return;
+        this.stopVideoFrameMonitor();
+        this.setMediaStale(false);
+        this.live(false);
+        this.clearRefreshStateTimer();
+        clearTimeout(this.playTimeoutId);
+        this.playTimeoutId = undefined;
         media.removeAttribute('playing');
         media.removeAttribute('playing-started');
         media.removeAttribute('loaded');
@@ -2733,9 +4047,9 @@ class WebRTCbabycam extends HTMLElement {
         if (!live) {
             const style = `
             <style>
-                @keyframes disappear {
-                    from { visibility: visible; }
-                    to { visibility: hidden; }
+                @keyframes livePulse {
+                    0%, 100% { opacity: 1; }
+                    50% { opacity: 0.3; }
                 }
                 .live {
                     position: absolute;
@@ -2747,16 +4061,24 @@ class WebRTCbabycam extends HTMLElement {
                     transform-origin: center; /* Ensures scaling is centered */
                     transform: scale(1); /* Ensures no resizing on zoom */
                     visibility: hidden;
+                    opacity: 0;
                     pointer-events: none;
                     z-index: 7;
+                    transition: opacity 800ms linear, visibility 0s linear 800ms;
                 }
                 .media[playing="video"] ~ .live[on], .media[playing="audiovideo"] ~ .live[on] {
-                    animation: disappear 4000ms steps(2, jump-none) 1;
+                    visibility: visible;
+                    opacity: 1;
                     color: red;
+                    transition: none;
+                    animation: livePulse 2000ms ease-in-out infinite;
                 }
                 .media[playing="audio"] ~ .live[on] {
-                    animation: disappear 4000ms steps(2, jump-none) 1;
+                    visibility: visible;
+                    opacity: 1;
                     color: white;
+                    transition: none;
+                    animation: livePulse 2000ms ease-in-out infinite;
                 }
             </style>
             `;
@@ -2769,18 +4091,23 @@ class WebRTCbabycam extends HTMLElement {
             live = container.querySelector(`.live`);
         }
 
+        // While lit, the dot shows an INFINITE pulse (it never self-terminates), so keeping it
+        // visible requires no fragile per-tick animation restart. Each live(true) renewal —
+        // driven by real media activity (rendered frames / timeupdate) and the heartbeat —
+        // simply re-arms a fade timer. When renewals stop (stream dead), the timer fires,
+        // `[on]` is removed, and the dot fades out via the CSS transition.
         if (on) {
-            if (live.hasAttribute("on")) {
-                const animation = live.getAnimations()[0];
-                animation?.cancel();
-                animation?.play();
-            }
-            else {
-                live.setAttribute("on", "");
-            }
+            live.setAttribute("on", "");
+            clearTimeout(this.liveFadeTimeoutId);
+            this.liveFadeTimeoutId = setTimeout(() => {
+                this.liveFadeTimeoutId = undefined;
+                container.querySelector(`.live`)?.removeAttribute("on");
+            }, WebRTCsession.LIVE_INDICATOR_TIMEOUT_MS);
         }
         else {
-            live?.removeAttribute("on");
+            clearTimeout(this.liveFadeTimeoutId);
+            this.liveFadeTimeoutId = undefined;
+            live.removeAttribute("on");
         }
     }
 
@@ -2828,6 +4155,9 @@ class WebRTCbabycam extends HTMLElement {
 
         if (media.muted) {
             this.trace("Unmuting media");
+            // A trusted click IS a fresh user gesture: override the unmuteEnabled flag if a
+            // past NotAllowedError latched it false, otherwise this tap silently does nothing.
+            WebRTCsession.enableUnmute();
             this.unmuteMedia();
             return;
         } // unmuted or no audio stream
@@ -2849,16 +4179,23 @@ class WebRTCbabycam extends HTMLElement {
         media.classList.add('pause-pending');
         media.pause();
     }
-
+ 
     playMedia(playMuted = undefined) {
 
         const { session, media } = this;
         
         if (!session || session.isTerminated) {
+            this.trace('Cannot play media from terminated session');
             return;
         } else if (!media.srcObject) {
             this.trace('Cannot play media without source stream');
             return;
+        }
+
+        if (this.playPromise) 
+        {
+            this.trace('Overlapping play media request ignored');
+            return this.playPromise; // don't overlap
         }
 
         let mute = media.muted;
@@ -2882,45 +4219,70 @@ class WebRTCbabycam extends HTMLElement {
         if (media.muted != mute)
             media.muted = mute;
 
-        this.trace(`Media play call muted=${media.muted}, unmuteEnabled=${WebRTCsession.unmuteEnabled}`);
+        // Capture generation so late resolves don't touch current state
+        const myGen = this.playGen;
+
+        this.trace(`Media play call muted=${media.muted}, unmuteEnabled=${WebRTCsession.unmuteEnabled}, gen=${myGen}`);
        
-        media.play()
+        const playPromise = media.play()
             .then(_ => {
+                if (myGen !== this.playGen) return;
                 media.classList.remove('play-pending');
                 if (!media.muted) {
                     media.classList.remove('unmute-pending');
                     WebRTCsession.enableUnmute();
                 }
             })
-            .catch(err => {
+            .catch(async err => {
+                if (myGen !== this.playGen) return; // ignore aborts from a replaced stream
+                if (err.name === "AbortError") {
+                    this.trace(`Media play aborted: ${err.message}`);
+                    return;
+                }
                 if (err.name == "NotAllowedError" && !media.muted && playMuted != true) {
                     media.classList.add('play-pending');
                     media.classList.add('unmute-pending');
                     this.trace(`${err.message}`);
-                    this.trace('Unmuted play failed');
+                    this.trace('Unmuted play failed; retrying muted');
 
                     WebRTCsession.enableUnmute(false);
-                    
-                    // retrying here often fails, so we need to wait for user interaction
+                    media.setAttribute('muted', '');
+                    media.muted = true;
+                    try {
+                        await media.play();
+                    } catch (retryErr) {
+                        this.trace(`Muted retry failed: ${retryErr.message}`);
+                    } finally {
+                        // Clear on both success AND failure; a stuck 'play-pending' would
+                        // permanently disable the pause auto-resume protection.
+                        media.classList.remove('play-pending');
+                    }
+                    return;
                 }
-                else if (err.name === "AbortError") {
-                    this.trace(`Media play aborted: ${err.message}`);
-                }
-                else {
-                    this.trace(`Media play failed: ${err.message}`);
-                }
+                this.trace(`Media play failed: ${err.message}`);
+            })
+            .finally(() => {
+                // Always release the re-entrancy latch for this promise, even if the
+                // generation changed mid-play (stream swap). The myGen guard only protects
+                // the state mutations in then/catch above — not the latch — otherwise a
+                // gen bump would leave playPromise stuck non-null and deadlock all future plays.
+                if (this.playPromise === playPromise) this.playPromise = null;
             });
+        this.playPromise = playPromise;
     }
 
     createMedia(muted) {
         const media = document.createElement('video');
         media.className = 'media';
         media.setAttribute('playsinline', '');
+        media.setAttribute('webkit-playsinline', '');
+        media.setAttribute('autoplay','');
         media.setAttribute('muted', '');
+        media.defaultMuted = true;
         media.muted = true;
-        media.playsinline = true;
+        media.playsInline = true;   // IDL attribute is camelCase; lowercase was an inert expando
         media.controls = false;
-        media.autoplay = false;
+        media.autoplay = true;
 
         if (muted === false) {
             media.classList.add('unmute-pending');
@@ -2937,6 +4299,8 @@ class WebRTCbabycam extends HTMLElement {
         this.trace(`MEDIA ${ev.type}`);
         switch (ev.type) {
             case 'emptied':
+                this.stopVideoFrameMonitor();
+                this.setMediaStale(false);
                 this.live(false);
                 media.removeAttribute('playing');
                 media.removeAttribute('playing-started');
@@ -2944,6 +4308,8 @@ class WebRTCbabycam extends HTMLElement {
                 break;
 
             case 'pause':
+                this.stopVideoFrameMonitor();
+                this.setMediaStale(false);
                 this.live(false);
                 if (!session || session.isTerminated) return;
 
@@ -2971,19 +4337,26 @@ class WebRTCbabycam extends HTMLElement {
                 }
                 break;
 
+            case 'loadedmetadata':
+                this.trace('Loaded metadata');
+                break;
+
             case 'canplay':
                 // Autoplay implementation
+                this.noteMediaActivity();
                 this.playMedia();
                 break;
 
             case 'play':
+                this.noteMediaActivity();
                 clearTimeout(this.playTimeoutId);
                 this.playTimeoutId = setTimeout(() => {
                     
-                    if (!this.isPlaying || !session?.isStreaming)
+                    if (!this.isPlayingActive || !session?.isStreaming)
                         if (!session?.isAnyCardPlaying) {
                             this.unloadRemoteStream();
                             this.trace('Play render timeout');
+                            session?.deferVideo?.('render timeout', WebRTCsession.RENDERING_TIMEOUT_MS);
                             session?.restartCall();
                         }
 
@@ -3002,8 +4375,9 @@ class WebRTCbabycam extends HTMLElement {
 
                 if (!videoTracks) {
                     media.setAttribute('playing', 'audio');
+                    this.noteMediaActivity(true); // start the monitor so the audio-flow stats fallback runs (Safari has no reliable timeupdate)
                     this.live(true);
-                    this.refreshState(); 
+                    this.refreshState();
                     this.refreshVolume();
                     return;
                 }
@@ -3021,10 +4395,48 @@ class WebRTCbabycam extends HTMLElement {
                 }
                 media.setAttribute("aspect-ratio", aspectRatio);
                 media.style.setProperty(`--video-aspect-ratio`, `${aspectRatio}`);
+                this.noteMediaActivity(true);
         
                 this.live(true);
                 this.refreshState(); 
                 this.refreshVolume();
+                break;
+
+            case 'timeupdate':
+                // For a MediaStream source, currentTime is a real-time clock: it advances
+                // while the element is 'potentially playing' even when NO media data
+                // arrives, so feeding it into the freeze detector would mask a frozen
+                // stream forever. While a peer connection exists, liveness comes from
+                // requestVideoFrameCallback and the getStats fallback; keep timeupdate as
+                // the liveness feed only for non-WebRTC playback where stats are absent.
+                if (!session?.activeCall?.peerConnection) {
+                    this.noteMediaActivity();
+                }
+                break;
+
+            case 'waiting':
+                this.stopVideoFrameMonitor();
+                if (session?.shouldKeepBackgroundAudio) {
+                    this.setMediaStale(false, false);
+                    break;
+                }
+                // 'waiting' (buffer underrun) is normal/transient on a live stream and usually
+                // recovers within a frame or two. Debounce the blur so the picture stays clear on
+                // brief stalls; only blur if the wait actually persists past the grace window.
+                this.scheduleMediaStale(WebRTCsession.MEDIA_STALE_GRACE_MS);
+                break;
+
+            case 'stalled':
+                // Per spec 'stalled' belongs to the remote-mode resource fetch algorithm;
+                // MediaStream (srcObject) playback uses local mode, so Firefox/Safari never
+                // fire it and Chromium's occurrences are documented noise from a healthy
+                // stream. Never treat it as fatal - at most start the debounced stale check
+                // (like 'waiting') and let the frame monitor make the real call.
+                if (session?.shouldKeepBackgroundAudio) {
+                    this.setMediaStale(false, false);
+                    break;
+                }
+                this.scheduleMediaStale(WebRTCsession.MEDIA_STALE_GRACE_MS);
                 break;
 
             case 'volumechange':
@@ -3048,15 +4460,31 @@ class WebRTCbabycam extends HTMLElement {
 
             case 'click':
                 WebRTCsession.enableUnmute();
+                session?.noteInterest?.();
                 if (media.controls) {
                     this.setControlsVisibility(true);
                 }
                 break;
 
-            case 'error':
-                this.lastError = media.error.message;
-                this.trace(`Media error ${media.error.code}; details: ${media.error.message}`);
+            case 'error': {
+                this.stopVideoFrameMonitor();
+                const code = media.error?.code ?? 'unknown';
+                const message = media.error?.message ?? 'unknown';
+                this.lastError = message;
+                // refreshState() renders the error tooltip from session.lastError, so a
+                // card-only assignment above would never surface. Mirror it onto the session.
+                if (session) session.lastError = message;
+                if (session?.shouldKeepBackgroundAudio) {
+                    this.setMediaStale(false, false);
+                    this.trace(`Media error ${code}; details: ${message}`);
+                    session?.restartCall?.();
+                    break;
+                }
+                this.setMediaStale(true, false);
+                session?.deferVideo?.('media error', WebRTCsession.RENDERING_TIMEOUT_MS);
+                this.trace(`Media error ${code}; details: ${message}`);
                 break;
+            }
 
             default:
                 this.trace(`Unhandled media event: ${ev.type}`);
@@ -3064,14 +4492,14 @@ class WebRTCbabycam extends HTMLElement {
     }
 }
 
-customElements.define('webrtc-babycam', WebRTCbabycam);
+if (!customElements.get('webrtc-babycam')) customElements.define('webrtc-babycam', WebRTCbabycam);
 
 // Register the card for Home Assistant
 const customCardRegistrationFinal = {
     type: 'webrtc-babycam',
     name: 'WebRTC Baby Camera',
     preview: false,
-    description: 'WebRTC babycam provides a lag-free 2-way audio, video, and image camera card.'
+    description: `WebRTC babycam provides a lag-free 2-way audio, video, and image camera card. (v${CARD_VERSION})`
 };
 if (window.customCards) window.customCards.push(customCardRegistrationFinal);
 else window.customCards = [customCardRegistrationFinal];
@@ -3139,12 +4567,19 @@ class WhepSignalingChannel extends SignalingChannel {
         this.timeout = timeout;
         this.eTag = '';
         this.offerData = null;
+        this.candidateControllers = new Set();
+        this.sessionUrl = null;        // per-session resource from the 201 Location header
+        this.queuedCandidates = [];    // gathered before the 201 (WHEP: player MUST buffer)
+        this.answered = false;
+        this.trickleSupported = true;  // flips false on 405/501 PATCH responses
+        this.closed = false;
     }
     generateSdpFragment(offerData, candidates) {
-        if (!candidates || !candidates.sdpMLineIndex) return '';
+        if (!Array.isArray(candidates) || candidates.length === 0) return '';
         const candidatesByMedia = {};
         for (const candidate of candidates) {
-            const mid = candidate.sdpMLineIndex;
+            const mid = candidate?.sdpMLineIndex;
+            if (mid == null) continue;
             if (candidatesByMedia[mid] === undefined) {
                 candidatesByMedia[mid] = [];
             }
@@ -3183,7 +4618,9 @@ class WhepSignalingChannel extends SignalingChannel {
         return ret;
     }
     get isOpen() {
-        return true;
+        // false after close() so the renegotiation guard correctly routes a closed
+        // channel into restartCall instead of PATCHing a dead session.
+        return !this.closed;
     }
     close() {
         if (this.httpTimeoutId) {
@@ -3192,33 +4629,79 @@ class WhepSignalingChannel extends SignalingChannel {
         }
         if (this.controller)
             this.controller.abort();
+        for (const controller of this.candidateControllers) {
+            try { controller.abort(); } catch { }
+        }
+        this.candidateControllers.clear();
+        this.queuedCandidates = [];
+        this.answered = false;
+        if (this.sessionUrl) {
+            // WHEP: the player MUST DELETE the session resource on teardown. Fire and
+            // forget (keepalive survives pagehide) so the unbounded-reconnect design never
+            // blocks on it - but without it every restart leaks a live server session.
+            try { fetch(this.sessionUrl, { method: 'DELETE', keepalive: true }).catch(() => { }); } catch { }
+            this.sessionUrl = null;
+        }
+        this.closed = true;
     }
-    async sendCandidate(candidates) {
+    async sendCandidate(candidate) {
+        if (!candidate) return;                    // end-of-candidates needs no PATCH
+        if (!this.trickleSupported || this.closed) return;
         if (!this.offerData) {
             if (this.onerror) this.onerror(new Error('Offer data not set before sending candidates.'));
             return;
         }
-        const sdpFrag = this.generateSdpFragment(this.offerData, [candidates]);
+        if (!this.answered) {
+            // WHEP: candidates gathered before the 201 response MUST be buffered; they are
+            // flushed by sendOffer. Gate on the answer ALONE - patchCandidates already
+            // falls back to the endpoint URL when the 201 carried no usable Location, so
+            // post-answer candidates must not be queued forever on such servers.
+            this.queuedCandidates.push(candidate);
+            return;
+        }
+        await this.patchCandidates([candidate]);
+    }
+    async patchCandidates(candidates) {
+        const sdpFrag = this.generateSdpFragment(this.offerData, candidates);
         if (!sdpFrag) return;
+        const controller = new AbortController();
+        this.candidateControllers.add(controller);
+        const timeoutId = setTimeout(() => controller.abort(), this.timeout);
         try {
-            const response = await fetch(this.url, {
+            // PATCH targets the per-session resource from the Location header, not the
+            // endpoint; If-Match is omitted entirely when no ETag was provided (an empty
+            // If-Match field value is malformed).
+            const headers = { 'Content-Type': 'application/trickle-ice-sdpfrag' };
+            if (this.eTag) headers['If-Match'] = this.eTag;
+            const response = await fetch(this.sessionUrl ?? this.url, {
+                signal: controller.signal,
                 method: 'PATCH',
-                headers: {
-                    'Content-Type': 'application/trickle-ice-sdpfrag',
-                    'If-Match': this.eTag,
-                },
+                headers,
                 body: sdpFrag,
             });
-            if (response.status !== 204) {
+            if (response.status === 405 || response.status === 501) {
+                // Server does not implement trickle ICE; stop PATCHing quietly - the
+                // candidates already flow through the SDP exchange.
+                this.trickleSupported = false;
+                this.ontrace?.('WHEP server does not support trickle ICE; disabling PATCH');
+            }
+            else if (response.status !== 204 && response.status !== 200) {
                 throw new Error(`sendCandidate bad status code ${response.status}`);
             }
         }
         catch (err) {
-            if (this.onerror) this.onerror(err);
+            if (this.onerror && !this.closed) this.onerror(err);
+        }
+        finally {
+            clearTimeout(timeoutId);
+            this.candidateControllers.delete(controller);
         }
     }
     async sendOffer(desc) {
-        this.close();
+        this.close();                              // DELETEs any previous session (renegotiation)
+        this.closed = false;                       // reopening with a fresh offer
+        this.answered = false;
+        this.eTag = '';
         this.offerData = this.parseOffer(desc.sdp);
         this.controller = new AbortController();
         this.httpTimeoutId = setTimeout(() => this.controller.abort(), this.timeout);
@@ -3236,13 +4719,31 @@ class WhepSignalingChannel extends SignalingChannel {
                 if (response.status !== 201) {
                     throw new Error(`sendOffer bad status code ${response.status}`);
                 }
-                this.eTag = response.headers.get('E-Tag');
+                this.eTag = response.headers.get('ETag') || response.headers.get('E-Tag') || '';
+                const location = response.headers.get('Location');
+                if (location) {
+                    // Resolve against an absolute base: config.url may itself be relative
+                    // (fetch resolves it against the document, but the URL constructor
+                    // requires an absolute base or it throws even for a valid Location).
+                    try { this.sessionUrl = new URL(location, new URL(this.url, window.location.href)).href; }
+                    catch { this.sessionUrl = null; }
+                }
+                if (!this.sessionUrl) {
+                    this.ontrace?.('WHEP 201 without usable Location header; trickle PATCH will target the endpoint URL and no DELETE will be sent');
+                }
                 if (this.onanswer) {
+                    // WHEP answers are raw application/sdp, not URL-encoded; decoding here
+                    // could corrupt valid '%' sequences or throw URIError on a stray '%'.
                     const sdp = await response.text();
                     this.onanswer({
                         type: 'answer',
-                        sdp: decodeURIComponent(sdp)
+                        sdp: sdp
                     });
+                }
+                this.answered = true;
+                const queued = this.queuedCandidates.splice(0);
+                if (queued.length && this.trickleSupported && !this.closed) {
+                    await this.patchCandidates(queued);
                 }
             }
             else {
@@ -3323,6 +4824,15 @@ class Go2RtcSignalingChannel extends SignalingChannel {
             this.trace(`Closing WebSocket in state: ${ws.readyState} (${this.getReadyStateText(ws.readyState)})`);
             if ([WebSocket.CONNECTING, WebSocket.OPEN].includes(ws.readyState)) {
                 ws.close();
+            }
+
+            // Settle a pending open() BEFORE detaching the listeners that would otherwise
+            // reject it: close() during CONNECTING must not leave the caller (startCall,
+            // suspended at await open()) waiting forever with the play-loop latch held.
+            if (this._rejectOpen) {
+                this._rejectOpen(new Error('Signaling channel closed'));
+                this._resolveOpen = null;
+                this._rejectOpen = null;
             }
 
             ws.removeEventListener('message', this.handleMessage);
@@ -3518,18 +5028,14 @@ class RTSPtoWebSignalingChannel extends SignalingChannel {
             });
             if (response) {
                 clearTimeout(this.httpTimeoutId);
-                const decoder = new TextDecoder("utf-8");
-                const reader = response.body.getReader();
-                let result = '';
-                while (true) {
-                    const { value, done } = await reader.read();
-                    if (done) break;
-                    result += decoder.decode(value, { stream: true });
-                }
-                const stringValue = decoder.decode(result);
+                const stringValue = await response.text();
                 if (response.ok) {
                     if (this.onanswer) {
-                        this.onanswer({ type: "answer", sdp: decodeURIComponent(stringValue) });
+                        // Decode only if the server URL-encoded its answer; otherwise a stray
+                        // '%' would throw URIError and lose the answer. Fall back to raw text.
+                        let answerSdp = stringValue;
+                        try { answerSdp = decodeURIComponent(stringValue); } catch { /* not URL-encoded */ }
+                        this.onanswer({ type: "answer", sdp: answerSdp });
                     }
                 }
                 else {
@@ -3556,4 +5062,1028 @@ class RTSPtoWebSignalingChannel extends SignalingChannel {
             this.httpTimeoutId = undefined;
         }
     }
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////
+/////////////////////////////////////////////////////////////////////////
+/////////////////////////////////
+
+/**
+ * BackgroundManager - owns background mode's persistence, fail-safes, and the minimized dock.
+ *
+ * - Persistent registry: ONE localStorage JSON key ('webrtc.background.v2') holding, per
+ *   session key: enabled, entity, friendlyName, returnPath, lastAliveAt, startedAt. Replaces
+ *   the legacy per-key 'webrtc.<key>.background' strings (migrated once, then removed) and is
+ *   garbage-collected so config-hash key changes can no longer strand orphaned flags.
+ * - Cross-tab coordination: BroadcastChannel plus a 'storage'-event fallback (both work on
+ *   plain-http HA origins; Web Locks does not). At most one tab holds a given hidden
+ *   background stream; enable/disable in any tab converges everywhere.
+ * - Lease/heartbeat: lastAliveAt is refreshed while a tab holds the stream; a crashed tab's
+ *   entry goes stale within LEASE_STALE_MS and shows up as 'suspended' (tap to reopen).
+ * - Page lifecycle: pagehide/freeze release the lease and close transports synchronously;
+ *   pageshow(persisted)/resume re-claim and kick the watchdog immediately.
+ * - Throttling fail-safe: while this tab holds a hidden background stream, a tiny dedicated
+ *   Worker (immune to hidden-page timer throttling) keeps lease heartbeats flowing and kicks
+ *   a starved watchdog so reconnects don't degrade to one attempt per minute.
+ * - MediaSession: lock-screen/OS media surface for the audible background stream.
+ */
+class BackgroundManager {
+    static REGISTRY_KEY = 'webrtc.background.v2';
+    static MSG_KEY = 'webrtc.background.msg';
+    static CHANNEL_NAME = 'webrtc-babycam:background';
+    static HEARTBEAT_INTERVAL_MS = 15000;
+    static LEASE_STALE_MS = 90000;                   // > 1/min worst-case throttled heartbeat
+    static LEGACY_ORPHAN_GC_MS = 14 * 24 * 3600000;
+    static ORPHAN_GC_MS = 30 * 24 * 3600000;
+    static TICKER_INTERVAL_MS = 5000;
+    static WATCHDOG_OVERDUE_MS = 7500;
+
+    static getInstance() {
+        const root = topWindow;
+        const sym = (root.__webrtcManagerSym ||= Symbol.for('webrtc-babycam:manager'));
+        let manager = root[sym];
+        if (manager && !BackgroundManager.isManagerAlive(manager)) {
+            manager = null;
+        }
+        if (!manager) {
+            manager = new BackgroundManager(root);
+            root[sym] = manager;
+            manager.init();
+        }
+        return manager;
+    }
+
+    static isManagerAlive(manager) {
+        try { return !!manager.ownerWindow?.document?.defaultView; } catch { return false; }
+    }
+
+    constructor(root) {
+        this.root = root;
+        this.ownerWindow = window;
+        this.eventTarget = new EventTarget();
+        this.tabId = `tab-${randomSalt()}`;
+        this.registry = {};                    // in-memory cache of the parsed registry
+        this.storageOk = true;
+        this.channel = null;
+        this.dock = null;
+        this.dockRefreshTimeoutId = undefined;
+        this.heartbeatIntervalId = undefined;
+        this.lastLeaseWriteByKey = new Map();
+        this.visibleKeys = new Set();          // session keys with a visible card in THIS tab
+        this.adoptedSessions = new WeakSet();
+        this.tickerWorker = null;
+        this.tickerUrl = null;
+        this.mediaSessionKey = null;
+        this._keepAliveLockRelease = null;
+        this._keepAliveLockPending = false;
+        this._keepAliveLockAbandoned = false;
+    }
+
+    init() {
+        this.loadRegistry();
+        this.migrateLegacyEntries();
+        this.collectGarbage();
+        this.openChannel();
+        this.installLifecycleHandlers();
+        this.heartbeatIntervalId = setInterval(() => this.heartbeatTick(), BackgroundManager.HEARTBEAT_INTERVAL_MS);
+        this.ensureDock();
+    }
+
+    // ------------------------------------------------------------------ registry
+
+    loadRegistry() {
+        // While persistence is failing (quota/private mode), memory is the authority:
+        // re-reading would clobber newer in-memory state with stale storage.
+        if (!this.storageOk) return;
+        const raw = safeStorage.get(BackgroundManager.REGISTRY_KEY);
+        if (raw == null) {
+            if (Object.keys(this.registry).length === 0) this.registry = {};
+            return;
+        }
+        try {
+            const parsed = JSON.parse(raw);
+            this.registry = (parsed && parsed.v === 2 && parsed.sessions) ? parsed.sessions : {};
+        } catch {
+            // corrupted JSON: quarantine and reset; never throw into the background getter
+            safeStorage.set('webrtc.background.corrupt', raw);
+            safeStorage.remove(BackgroundManager.REGISTRY_KEY);
+            this.registry = {};
+        }
+    }
+
+    writeRegistry(mutator) {
+        // Read-modify-write merge: no cross-tab lock exists on plain http, so re-read the
+        // latest before writing to shrink the race window; entry updates are idempotent.
+        this.loadRegistry();
+        mutator(this.registry);
+        this.storageOk = safeStorage.set(BackgroundManager.REGISTRY_KEY,
+            JSON.stringify({ v: 2, sessions: this.registry }));
+        this.eventTarget.dispatchEvent(new CustomEvent('registry'));
+    }
+
+    entry(key) { return this.registry[key]; }
+
+    isEnabled(key, configDefault = false) {
+        // HOT PATH: called from shouldKeepBackgroundAudio on every media event.
+        // Pure in-memory read; the cache refreshes on storage/channel events + heartbeat.
+        const e = this.registry[key];
+        if (e && typeof e.enabled === 'boolean') return e.enabled;
+        return configDefault === true;
+    }
+
+    setEnabled(key, enabled, meta = {}) {
+        const before = this.registry[key]?.enabled === true;
+        this.writeRegistry(reg => {
+            const e = reg[key] ?? (reg[key] = {});
+            e.enabled = enabled;
+            if (meta.entity) e.entity = meta.entity;
+            if (meta.friendlyName) e.friendlyName = meta.friendlyName;
+            // Only seed a missing returnPath on enable. Disabling (or re-enabling via the
+            // dock from an unrelated page) must not overwrite the card's real dashboard
+            // path with wherever the dock happened to be clicked; noteCardVisible keeps
+            // the path fresh from the card's actual view.
+            if (meta.returnPath && enabled && !e.returnPath) e.returnPath = meta.returnPath;
+            if (meta.dock === false) e.dock = false; else delete e.dock;
+            e.lastAliveAt = Date.now();
+            if (enabled && !before) e.startedAt = Date.now();
+            delete e.legacy;
+        });
+        this.dispatchBackgroundEvent(key, enabled);
+        this.broadcast({ type: 'set-enabled', key, enabled });
+        this.refreshDock();
+    }
+
+    dispatchBackgroundEvent(key, enabled) {
+        const session = WebRTCsession.sessions.get(key);
+        session?.eventTarget.dispatchEvent(
+            new CustomEvent('background', { detail: { background: enabled } }));
+    }
+
+    // ------------------------------------------------------------------ migration & GC
+
+    migrateLegacyEntries() {
+        const legacyKeys = safeStorage.keys(/^webrtc\.(.+)\.background$/);
+        if (legacyKeys.length === 0) return;
+        this.writeRegistry(reg => {
+            for (const storageKey of legacyKeys) {
+                const sessionKey = storageKey.slice('webrtc.'.length, -'.background'.length);
+                if (reg[sessionKey]) continue;                       // v2 already authoritative
+                const value = safeStorage.get(storageKey);
+                reg[sessionKey] = {
+                    // preserve stored FALSE overrides too: they suppress config.background=true
+                    enabled: String(value).toLowerCase() === 'true',
+                    entity: null, friendlyName: null, returnPath: null,
+                    lastAliveAt: Date.now(), startedAt: 0, legacy: true
+                };
+            }
+        });
+        // Never destroy the source of truth if the v2 write did not persist.
+        if (!this.storageOk) return;
+        for (const storageKey of legacyKeys) safeStorage.remove(storageKey);
+    }
+
+    collectGarbage() {
+        const now = Date.now();
+        this.writeRegistry(reg => {
+            for (const [key, e] of Object.entries(reg)) {
+                const idleMs = now - Math.max(e.lastAliveAt ?? 0, e.startedAt ?? 0);
+                if (e.legacy && idleMs > BackgroundManager.LEGACY_ORPHAN_GC_MS) delete reg[key];
+                else if (idleMs > BackgroundManager.ORPHAN_GC_MS) delete reg[key];
+            }
+        });
+    }
+
+    reapConfigChangeOrphans(session) {
+        // The session key embeds a hash of url/url_type/image_url/microphone, so editing a
+        // card's config orphans its old entry AND silently loses the user's pin. Migrate the
+        // precise case "same entity, same dashboard view, different hash, not running
+        // anywhere" - i.e. the same card, reconfigured - then reap the old entry.
+        const here = this.currentPath();
+        // Key format: <entity-sanitized>[-a][-v]-<variantHash36>. Requiring an identical
+        // prefix (everything but the trailing hash) means "same entity AND same audio/video
+        // capabilities, only the url/image/microphone variant changed" - a sibling card of
+        // the same entity with different capabilities keeps its own pin.
+        const prefixOf = (k) => {
+            const idx = String(k).lastIndexOf('-');
+            return idx > 0 ? String(k).slice(0, idx) : String(k);
+        };
+        const sessionPrefix = prefixOf(session.key);
+        const isOrphan = (key, e) => key !== session.key
+            && e && e.entity === session.config.entity
+            && prefixOf(key) === sessionPrefix
+            && e.returnPath === here
+            && Date.now() - (e.lastAliveAt ?? 0) >= BackgroundManager.LEASE_STALE_MS;
+        // pre-scan the in-memory cache so the common no-orphan case costs no storage write
+        if (!Object.entries(this.registry).some(([key, e]) => isOrphan(key, e))) return;
+        this.writeRegistry(reg => {
+            for (const [key, e] of Object.entries(reg)) {
+                if (!isOrphan(key, e)) continue;
+                if (e.enabled === true && !reg[session.key]) {
+                    reg[session.key] = { ...e, legacy: false };
+                }
+                delete reg[key];
+            }
+        });
+    }
+
+    // ------------------------------------------------------------------ cross-tab channel
+
+    openChannel() {
+        try {
+            if ('BroadcastChannel' in window) {    // available on http; NOT secure-context-only
+                this.channel = new BroadcastChannel(BackgroundManager.CHANNEL_NAME);
+                this.channel.onmessage = ev => this.onChannelMessage(ev.data);
+            }
+        } catch { this.channel = null; }
+        // storage fallback ALWAYS installed too (old WebViews; doubles as reconciler):
+        window.addEventListener('storage', ev => {
+            if (ev.key === BackgroundManager.REGISTRY_KEY) {
+                this.loadRegistry();
+                this.reconcileSessions();
+                this.refreshDockThrottled();
+            }
+            else if (ev.key === BackgroundManager.MSG_KEY && ev.newValue) {
+                try { this.onChannelMessage(JSON.parse(ev.newValue)); } catch { }
+            }
+        });
+    }
+
+    broadcast(msg) {
+        msg.tabId = this.tabId;
+        msg.nonce = Math.random();                 // distinct storage events for repeat messages
+        try { this.channel?.postMessage(msg); } catch { }
+        safeStorage.set(BackgroundManager.MSG_KEY, JSON.stringify(msg));
+    }
+
+    broadcastClaim(key, priority = 'hidden') {
+        this.broadcast({ type: 'claim', key, priority });
+    }
+
+    onChannelMessage(msg) {
+        if (!msg || msg.tabId === this.tabId) return;
+        switch (msg.type) {
+            case 'set-enabled':
+                this.loadRegistry();
+                this.dispatchBackgroundEvent(msg.key, msg.enabled === true);
+                this.refreshDockThrottled();
+                break;
+            case 'claim': {
+                // Another tab's card took over this key: release OUR hidden designee so a
+                // single tab streams (visible cards are exempt - multi-viewer is legitimate).
+                const session = WebRTCsession.sessions.get(msg.key);
+                if (session?.state.backgroundCard) {
+                    if (msg.priority === 'visible') {
+                        // A tab with an on-screen viewer ALWAYS beats a hidden holder;
+                        // tie-breaking here would leave a duplicate hidden stream running.
+                        session.releaseBackground();
+                    }
+                    // Hidden vs hidden: tie-break deterministically by tabId. When two tabs
+                    // claim simultaneously exactly one must yield - otherwise both release
+                    // and the stream dies, or both hold and double-stream.
+                    else if (String(msg.tabId) > String(this.tabId)) {
+                        session.releaseBackground();
+                    } else {
+                        // We outrank the claimer; reassert so the other tab yields instead.
+                        this.broadcast({ type: 'claim', key: msg.key, priority: 'hidden' });
+                    }
+                }
+                this.refreshDockThrottled();
+                break;
+            }
+        }
+    }
+
+    reconcileSessions() {
+        // Cross-tab disable that arrived only via storage: unwind any hidden designee whose
+        // registry entry no longer says enabled (previously this stream ran on orphaned).
+        for (const session of WebRTCsession.sessions.values()) {
+            if (session.state.backgroundCard && !session.background) {
+                this.dispatchBackgroundEvent(session.key, false);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ lease / heartbeat
+
+    adoptSession(session) {
+        if (this.adoptedSessions.has(session)) return;
+        this.adoptedSessions.add(session);
+
+        // Sessions whose background mode comes from `background: true` CONFIG (never pinned
+        // via the UI) would otherwise have no registry entry: no dock chip, no lease, and
+        // silent park states. Materialize an entry so all fail-safes apply uniformly.
+        if (session.background && !this.entry(session.key)) {
+            this.writeRegistry(reg => {
+                if (!reg[session.key]) {
+                    reg[session.key] = {
+                        enabled: true,
+                        entity: session.config.entity,
+                        friendlyName: session.config.entity,
+                        returnPath: null,
+                        lastAliveAt: Date.now(),
+                        startedAt: Date.now()
+                    };
+                }
+            });
+        }
+
+        const bus = session.eventTarget;
+        bus.addEventListener('heartbeat', () => {
+            if (session.background && session.state.cards.size > 0) this.noteAlive(session.key);
+            this.refreshDockThrottled();
+        });
+        bus.addEventListener('status', () => this.refreshDockThrottled());
+        bus.addEventListener('parked', () => this.refreshDock());
+        bus.addEventListener('mute', () => this.refreshDockThrottled());
+        bus.addEventListener('unmuteEnabled', (ev) => {
+            if (ev.detail?.unmuteEnabled && session.parked === 'muted') session.unpark();
+            this.refreshDockThrottled();
+        });
+    }
+
+    noteAlive(key) {
+        const last = this.lastLeaseWriteByKey.get(key) ?? 0;
+        if (Date.now() - last < BackgroundManager.HEARTBEAT_INTERVAL_MS) return;
+        this.lastLeaseWriteByKey.set(key, Date.now());
+        this.writeRegistry(reg => {
+            if (reg[key]) {
+                reg[key].lastAliveAt = Date.now();
+                reg[key].heldBy = this.tabId;
+            }
+        });
+    }
+
+    releaseLease(key) {
+        // Age the lease out immediately so other tabs' docks flip to 'suspended' now
+        // instead of after LEASE_STALE_MS - but only when THIS tab holds it; a session
+        // terminating here must not age out a lease another tab is keeping fresh.
+        this.lastLeaseWriteByKey.delete(key);
+        this.writeRegistry(reg => {
+            const e = reg[key];
+            if (e && (!e.heldBy || e.heldBy === this.tabId)) {
+                e.lastAliveAt = Date.now() - BackgroundManager.LEASE_STALE_MS;
+                delete e.heldBy;
+            }
+        });
+    }
+
+    heartbeatTick() {
+        this.loadRegistry();
+        this.reconcileSessions();
+        this.ensureDock();
+        this.updateTicker();
+        this.refreshDock();
+    }
+
+    // ------------------------------------------------------------------ card notifications
+
+    noteCardVisible(session, card) {
+        this.visibleKeys.add(session.key);
+        if (session.background) {
+            const meta = session.describeForRegistry();
+            this.writeRegistry(reg => {
+                const e = reg[session.key];
+                if (e) {
+                    // last-visible moment beats pin-time capture: 'return' goes where the
+                    // user actually was, even if they pinned on a different dashboard
+                    e.returnPath = meta.returnPath;
+                    if (!e.entity) e.entity = meta.entity;
+                    if (meta.friendlyName) e.friendlyName = meta.friendlyName;
+                    e.lastAliveAt = Date.now();
+                    delete e.legacy;
+                }
+            });
+            this.broadcast({ type: 'claim', key: session.key, priority: 'visible' });
+        }
+        this.reapConfigChangeOrphans(session);
+        this.refreshDockThrottled();
+    }
+
+    noteCardHidden(session, card) {
+        if (![...session.state.cards].some(c => c.isVisibleInViewport)) {
+            this.visibleKeys.delete(session.key);
+        }
+        this.updateTicker();
+        this.refreshDockThrottled();
+    }
+
+    // ------------------------------------------------------------------ navigation & dock actions
+
+    currentPath() {
+        try { const l = this.root.location; return l.pathname + l.search; }
+        catch { const l = window.location; return l.pathname + l.search; }
+    }
+
+    navigate(path) {
+        // HA frontend convention (src/common/navigate.ts): pushState then a plain
+        // 'location-changed' Event on the main window with detail as an expando.
+        try {
+            this.root.history.pushState(null, '', path);
+            const ev = new Event('location-changed', { bubbles: true, composed: true });
+            ev.detail = { replace: false };
+            this.root.dispatchEvent(ev);
+        } catch {
+            try { window.location.assign(path); } catch { }
+        }
+    }
+
+    dockReturn(key) {
+        WebRTCsession.enableUnmute();              // the tap IS the autoplay gesture
+        const session = WebRTCsession.sessions.get(key);
+        session?.unpark?.();
+        const e = this.entry(key);
+        if (e?.returnPath && e.returnPath !== this.currentPath()) {
+            this.navigate(e.returnPath);
+        }
+        // if already on the right view, the card's IntersectionObserver takes it from here
+    }
+
+    dockResume(key) {
+        WebRTCsession.enableUnmute();
+        const session = WebRTCsession.sessions.get(key);
+        if (session) {
+            session.unpark();
+            session.kick();
+        }
+        this.refreshDockThrottled();
+    }
+
+    dockClose(key) {
+        // SOFT close: stop the audio NOW (park) but keep the designee attached through the
+        // dock's undo window, so UNDO can genuinely resume the live stream. A hard unpin
+        // here would detach the designee, the 3s termination grace would kill the session,
+        // and a 5s undo could only ever re-arm - never resume.
+        const session = WebRTCsession.sessions.get(key);
+        if (session && session.state.cards.size > 0 && !session.isTerminated) {
+            session.park('closing');
+        } else {
+            this.setEnabled(key, false);           // nothing streaming here: plain unpin
+        }
+        this.refreshDockThrottled();
+    }
+
+    dockCloseFinal(key) {
+        // Undo window elapsed: commit the close as a full unpin (preference cleared).
+        const session = WebRTCsession.sessions.get(key);
+        if (session && session.background) {
+            session.background = false;            // routes through setEnabled + 'background' event
+        } else {
+            this.setEnabled(key, false);
+        }
+    }
+
+    dockUndo(key) {
+        const session = WebRTCsession.sessions.get(key);
+        if (session && session.parked === 'closing') {
+            session.unpark();                      // resume the still-attached designee
+        } else if (!this.isEnabled(key)) {
+            this.setEnabled(key, true);
+        }
+        this.refreshDockThrottled();
+    }
+
+    snapshot() {
+        const now = Date.now();
+        const chips = [];
+        for (const [key, e] of Object.entries(this.registry)) {
+            if (!e || e.enabled !== true) continue;
+            if (e.dock === false) continue;
+            if (this.visibleKeys.has(key)) continue;
+            const session = WebRTCsession.sessions.get(key);
+            let state;
+            if (session && session.state.cards.size > 0 && !session.isTerminated) {
+                const designee = session.state.backgroundCard;
+                if (session.parked === 'muted') state = 'blocked';
+                else if (session.parked) state = 'expired';
+                else if (designee?.media?.muted && designee.media.classList.contains('unmute-pending')) state = 'blocked';
+                else if (session.status === 'error') state = 'error';
+                else if (session.isStreaming) state = 'live';
+                else state = 'connecting';
+            }
+            else if (now - (e.lastAliveAt ?? 0) < BackgroundManager.LEASE_STALE_MS) {
+                state = 'elsewhere';
+            }
+            else {
+                state = 'suspended';
+            }
+            chips.push({ key, name: e.friendlyName || e.entity || key, state });
+        }
+        return chips;
+    }
+
+    // ------------------------------------------------------------------ page lifecycle
+
+    installLifecycleHandlers() {
+        const suspend = () => {
+            for (const session of WebRTCsession.sessions.values()) {
+                if (session.ownerWindow !== window) continue;
+                if (session.background && session.state.cards.size > 0) this.releaseLease(session.key);
+                // Synchronous teardown: an awaited teardown never completes in pagehide and
+                // leaves the go2rtc socket to time out server-side. Iterate ALL calls, not
+                // just activeCall - an in-flight connecting call is registered in
+                // state.calls but not yet active.
+                for (const call of [...session.state.calls.values()]) {
+                    session.endCallFast(call);
+                }
+            }
+            this.stopTicker();
+        };
+        window.addEventListener('pagehide', suspend);
+        window.addEventListener('pageshow', ev => {
+            if (ev.persisted) this.resumeSessions();
+        });
+        if ('onfreeze' in document) {              // Page Lifecycle API (Chromium)
+            document.addEventListener('freeze', suspend);
+            document.addEventListener('resume', () => this.resumeSessions());
+        }
+        document.addEventListener('visibilitychange', () => {
+            this.updateTicker();
+            this.refreshDockThrottled();
+        });
+    }
+
+    resumeSessions() {
+        for (const session of WebRTCsession.sessions.values()) {
+            if (session.ownerWindow !== window) continue;
+            if (session.state.cards.size === 0 || session.isTerminated) continue;
+            if (session.background) this.noteAlive(session.key);
+            session.lastTickDate = 0;              // a frozen gap is not starvation evidence
+            session.relieveVideoPressure?.(true);
+            session.timeoutCall?.(session.activeCall);
+            session.kick?.();
+        }
+        this.refreshDock();
+    }
+
+    // ------------------------------------------------------------------ throttling-proof ticker
+
+    updateTicker() {
+        let needed = false;
+        try {
+            needed = document.hidden === true && [...WebRTCsession.sessions.values()].some(s =>
+                s.ownerWindow === window && s.background && s.state.cards.size > 0 && !s.isTerminated);
+        } catch { }
+        if (needed) {
+            this.startTicker();
+            this.acquireKeepAliveLock();
+        } else {
+            this.stopTicker();
+            this.releaseKeepAliveLock();
+        }
+    }
+
+    acquireKeepAliveLock() {
+        // Chromium's Energy Saver freezes hidden+silent tabs after 5 minutes; a held Web
+        // Lock is a documented exemption. Web Locks is secure-context-only, so this is a
+        // best-effort extra on https installs - the worker ticker remains the primary
+        // fail-safe on plain-http HA.
+        //
+        // Grants arrive as a LATER task, never within the requesting task, and updateTicker
+        // runs several times per visibilitychange dispatch - so an explicit pending flag is
+        // required: guarding only on the release resolver would issue duplicate requests
+        // whose second grant overwrites the first resolver, permanently leaking a held lock.
+        this._keepAliveLockAbandoned = false;      // re-acquire while pending keeps the grant
+        if (this._keepAliveLockRelease || this._keepAliveLockPending) return;
+        try {
+            if (!window.isSecureContext || !navigator.locks?.request) return;
+            this._keepAliveLockPending = true;
+            navigator.locks.request('webrtc-babycam:keepalive', { mode: 'shared' },
+                () => new Promise(resolve => {
+                    this._keepAliveLockPending = false;
+                    if (this._keepAliveLockAbandoned) {
+                        // released while the grant was in flight (hide->show race)
+                        this._keepAliveLockAbandoned = false;
+                        resolve();
+                        return;
+                    }
+                    this._keepAliveLockRelease = resolve;
+                })
+            ).catch(() => {
+                this._keepAliveLockPending = false;
+                this._keepAliveLockRelease = null;
+            });
+        } catch {
+            this._keepAliveLockPending = false;
+        }
+    }
+
+    releaseKeepAliveLock() {
+        if (this._keepAliveLockPending) this._keepAliveLockAbandoned = true;
+        try { this._keepAliveLockRelease?.(); } catch { }
+        this._keepAliveLockRelease = null;
+    }
+
+    startTicker() {
+        if (this.tickerWorker || typeof Worker === 'undefined') return;
+        try {
+            // Dedicated-worker timers are exempt from hidden-page timer throttling; this is
+            // the metronome that keeps lease heartbeats and reconnect attempts flowing when
+            // main-thread timers degrade to one per minute (intensive throttling applies
+            // exactly during reconnect gaps: no live MediaStreamTrack, no audible audio).
+            const src = `setInterval(() => postMessage(0), ${BackgroundManager.TICKER_INTERVAL_MS});`;
+            this.tickerUrl = URL.createObjectURL(new Blob([src], { type: 'text/javascript' }));
+            this.tickerWorker = new Worker(this.tickerUrl);
+            this.tickerWorker.onmessage = () => this.onWorkerTick();
+        } catch {
+            // CSP may block blob workers: accept main-thread cadence (starvation-aware
+            // watchdog still prevents false teardowns; recovery just runs slower).
+            this.stopTicker();
+        }
+    }
+
+    stopTicker() {
+        try { this.tickerWorker?.terminate(); } catch { }
+        this.tickerWorker = null;
+        if (this.tickerUrl) {
+            try { URL.revokeObjectURL(this.tickerUrl); } catch { }
+            this.tickerUrl = null;
+        }
+    }
+
+    onWorkerTick() {
+        const now = Date.now();
+        for (const session of WebRTCsession.sessions.values()) {
+            if (session.ownerWindow !== window || session.isTerminated) continue;
+            if (!(session.background && session.state.cards.size > 0)) continue;
+            this.noteAlive(session.key);
+            if (now - (session.lastTickDate || 0) > BackgroundManager.WATCHDOG_OVERDUE_MS) {
+                session.kick();
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ media session
+
+    updateMediaSession() {
+        if (!('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
+        let active = null;
+        try {
+            // A session parked by the OS pause button ('user') stays "active" in the
+            // paused state, so the lock-screen surface that parked it survives to resume it.
+            active = [...WebRTCsession.sessions.values()].find(s =>
+                s.ownerWindow === window && s.background && !s.isTerminated
+                && s.state.cards.size > 0
+                && (s.parked === 'user'
+                    || [...s.state.cards].some(c => c.media && !c.media.muted && c.isPlaying)));
+        } catch { }
+        try {
+            if (!active) {
+                if (this.mediaSessionKey) {
+                    navigator.mediaSession.metadata = null;
+                    navigator.mediaSession.playbackState = 'none';
+                    this.mediaSessionKey = null;
+                }
+                return;
+            }
+            const desiredState = active.parked === 'user' ? 'paused' : 'playing';
+            if (this.mediaSessionKey === active.key) {
+                navigator.mediaSession.playbackState = desiredState;
+                return;
+            }
+            this.mediaSessionKey = active.key;
+            const e = this.entry(active.key);
+            navigator.mediaSession.metadata = new MediaMetadata({
+                title: e?.friendlyName ?? active.config.entity,
+                artist: 'WebRTC Babycam'
+            });
+            navigator.mediaSession.playbackState = desiredState;
+            // Action handlers run with user activation, so 'play' can legally re-unmute.
+            navigator.mediaSession.setActionHandler('play', () => {
+                WebRTCsession.enableUnmute();
+                const s = WebRTCsession.sessions.get(this.mediaSessionKey);
+                s?.unpark?.();
+                s?.kick?.();
+                try { navigator.mediaSession.playbackState = 'playing'; } catch { }
+            });
+            navigator.mediaSession.setActionHandler('pause', () => {
+                // OS pause on a background stream = park loudly (resumable), instead of
+                // the browser-default pause fighting the card's auto-resume loop.
+                const s = WebRTCsession.sessions.get(this.mediaSessionKey);
+                if (s?.shouldKeepBackgroundAudio) {
+                    s.park('user');
+                    try { navigator.mediaSession.playbackState = 'paused'; } catch { }
+                }
+            });
+        } catch { }
+    }
+
+    // ------------------------------------------------------------------ dock lifecycle
+
+    ensureDock() {
+        // The dock element class is per-realm; create it in this script's own document
+        // (HA loads card resources in the top document, which is the intended home).
+        const doc = document;
+        if (this.dock && this.dock.isConnected) return;
+        const body = doc.body;
+        if (!body) return;                          // heartbeatTick retries
+        try {
+            let dock = body.querySelector(':scope > webrtc-babycam-dock');
+            if (!dock) {
+                dock = doc.createElement('webrtc-babycam-dock');
+                body.appendChild(dock);
+            }
+            this.dock = dock;
+        } catch { }
+    }
+
+    refreshDock() {
+        this.updateMediaSession();
+        this.updateTicker();
+        try { this.dock?.refresh?.(); } catch { }
+    }
+
+    refreshDockThrottled() {
+        if (this.dockRefreshTimeoutId) return;
+        this.dockRefreshTimeoutId = setTimeout(() => {
+            this.dockRefreshTimeoutId = undefined;
+            this.refreshDock();
+        }, 250);
+    }
+}
+
+/**
+ * <webrtc-babycam-dock> - the minimized surface for background sessions.
+ *
+ * A small fixed pill (bottom-center, safe-area aware) that exists only while at least one
+ * background session is active and its card is not on screen. Expanding it lists each
+ * session with its live state and two actions: RETURN (navigate back to the card's
+ * dashboard view) and CLOSE (stop the background stream, with a 5s UNDO). A row in the
+ * 'blocked' state turns the tap itself into the autoplay-unmute gesture. The dock never
+ * plays sound, never shifts layout, and is suppressed while anything is fullscreen.
+ */
+class WebRTCbabycamDock extends HTMLElement {
+    static UNDO_TIMEOUT_MS = 5000;
+    static COLLAPSE_TIMEOUT_MS = 15000;
+
+    static STATE_TEXT = {
+        live: 'Live audio · tap to open',
+        connecting: 'Connecting…',
+        blocked: 'Audio blocked — tap to enable',
+        expired: 'Paused — tap to resume',
+        error: 'Reconnecting… · tap to open',
+        elsewhere: 'Playing in another tab',
+        suspended: 'Tap to open'
+    };
+
+    constructor() {
+        super();
+        this.rendered = false;
+        this.undo = null;                          // { key, name, timerId }
+        this.collapseTimeoutId = undefined;
+        this.outsidePointerDown = this.outsidePointerDown.bind(this);
+        this.fullscreenEvent = this.fullscreenEvent.bind(this);
+    }
+
+    connectedCallback() {
+        if (!this.rendered) {
+            this.render();
+            this.rendered = true;
+        }
+        this.ownerDocument.addEventListener('fullscreenchange', this.fullscreenEvent);
+        this.refresh();
+    }
+
+    disconnectedCallback() {
+        this.ownerDocument.removeEventListener('fullscreenchange', this.fullscreenEvent);
+        this.ownerDocument.removeEventListener('pointerdown', this.outsidePointerDown, true);
+        clearTimeout(this.collapseTimeoutId);
+        this.collapseTimeoutId = undefined;
+    }
+
+    render() {
+        this.attachShadow({ mode: 'open' });
+        this.shadowRoot.innerHTML = `
+        <style>
+            :host {
+                position: fixed;
+                left: 50%;
+                transform: translateX(-50%);
+                bottom: calc(env(safe-area-inset-bottom, 0px) + 16px);
+                z-index: var(--webrtc-babycam-dock-z-index, 6); /* below HA dialogs (8) */
+                font-family: var(--paper-font-body1_-_font-family, Roboto, sans-serif);
+                color: var(--primary-text-color, #212121);
+                display: none;
+                pointer-events: none;
+                max-width: min(360px, calc(100vw - 32px));
+            }
+            :host([active]) { display: block; }
+            :host([suppressed]) { display: none; }
+            .chip, .panel {
+                pointer-events: auto;
+                background: var(--card-background-color, var(--ha-card-background, #fff));
+                color: var(--primary-text-color, #212121);
+                box-shadow: var(--ha-card-box-shadow, 0 2px 8px rgba(0,0,0,.28));
+                border: 1px solid var(--divider-color, rgba(0,0,0,.12));
+            }
+            .chip {
+                display: flex; align-items: center; gap: 8px;
+                height: 40px; padding: 0 14px;
+                border-radius: 20px;
+                cursor: pointer; user-select: none;
+                font-size: 13px;
+            }
+            :host([expanded]) .chip { display: none; }
+            .chip svg { width: 18px; height: 18px; fill: var(--primary-color, #03a9f4); }
+            .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; background: gray; }
+            .dot[state="live"]       { background: var(--success-color, #0f9d58);
+                                       animation: dockPulse 2s ease-in-out infinite; }
+            .dot[state="connecting"] { background: var(--secondary-text-color, #727272);
+                                       animation: dockPulse 1s ease-in-out infinite; }
+            .dot[state="blocked"], .dot[state="expired"] { background: var(--warning-color, #ffa600); }
+            .dot[state="error"]      { background: var(--error-color, #db4437); }
+            .dot[state="elsewhere"]  { background: var(--info-color, #4285f4); }
+            .dot[state="suspended"]  { background: var(--secondary-text-color, #727272); }
+            @keyframes dockPulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+            @media (prefers-reduced-motion: reduce) {
+                .dot { animation: none !important; }
+            }
+            .panel { display: none; padding: 4px 0; border-radius: 16px; }
+            :host([expanded]) .panel { display: block; }
+            .row {
+                display: flex; align-items: center; gap: 10px;
+                min-height: 48px; padding: 0 8px 0 16px;
+                cursor: pointer;
+            }
+            .row + .row, .undo + .row, .row + .undo { border-top: 1px solid var(--divider-color, rgba(0,0,0,.12)); }
+            .name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+                    white-space: nowrap; font-size: 14px; }
+            .sub  { display: block; font-size: 11px; color: var(--secondary-text-color, #727272); }
+            .row[state="blocked"] .sub, .row[state="expired"] .sub { color: var(--warning-color, #ffa600); }
+            .row[state="error"] .sub { color: var(--error-color, #db4437); }
+            .iconbtn {
+                width: 44px; height: 44px; flex: none;
+                display: flex; align-items: center; justify-content: center;
+                border-radius: 50%; cursor: pointer;
+            }
+            .iconbtn svg { width: 20px; height: 20px; fill: var(--secondary-text-color, #727272); }
+            .iconbtn:hover { background: rgba(127,127,127,.12); }
+            .undo {
+                display: flex; align-items: center; gap: 10px;
+                min-height: 40px; padding: 0 16px; font-size: 13px;
+            }
+            .undo button {
+                all: unset; cursor: pointer; font-weight: 500;
+                color: var(--primary-color, #03a9f4); padding: 8px;
+            }
+        </style>
+        <div class="chip" part="chip" role="button" tabindex="0" aria-label="Background cameras" title="WebRTC Babycam v${CARD_VERSION}">
+            <svg viewBox="0 0 24 24"><path d="M16,12V4H17V2H7V4H8V12L6,14V16H11.2V22H12.8V16H18V14L16,12Z"/></svg>
+            <span class="count"></span>
+            <span class="dot"></span>
+        </div>
+        <div class="panel" role="list"></div>`;
+
+        this.shadowRoot.querySelector('.chip').addEventListener('click', () => this.expand(true));
+        this.shadowRoot.querySelector('.panel').addEventListener('click', ev => this.panelClick(ev));
+    }
+
+    static escape(text) {
+        return String(text)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    expand(on) {
+        clearTimeout(this.collapseTimeoutId);
+        this.collapseTimeoutId = undefined;
+        if (on) {
+            this.setAttribute('expanded', '');
+            this.ownerDocument.addEventListener('pointerdown', this.outsidePointerDown, true);
+            this.collapseTimeoutId = setTimeout(() => this.expand(false), WebRTCbabycamDock.COLLAPSE_TIMEOUT_MS);
+        } else {
+            this.removeAttribute('expanded');
+            this.ownerDocument.removeEventListener('pointerdown', this.outsidePointerDown, true);
+        }
+    }
+
+    outsidePointerDown(ev) {
+        if (ev.composedPath().includes(this)) return;
+        this.expand(false);
+    }
+
+    fullscreenEvent() {
+        this.toggleAttribute('suppressed', !!this.ownerDocument.fullscreenElement);
+    }
+
+    panelClick(ev) {
+        const actionEl = ev.target.closest('[data-action]');
+        if (!actionEl) return;
+        const key = actionEl.closest('[data-key]')?.dataset.key;
+        if (!key) return;
+        const manager = BackgroundManager.getInstance();
+        try {
+            switch (actionEl.dataset.action) {
+                case 'return':
+                    manager.dockReturn(key);
+                    this.expand(false);
+                    break;
+                case 'resume':
+                    manager.dockResume(key);
+                    break;
+                case 'close':
+                    this.armUndo(key);
+                    manager.dockClose(key);
+                    break;
+                case 'undo':
+                    this.clearUndo();
+                    manager.dockUndo(key);
+                    break;
+            }
+        } catch (err) {
+            // dock failures must never propagate into session/watchdog code
+            console.warn('webrtc-babycam-dock action failed', err);
+        }
+        this.refresh();
+    }
+
+    armUndo(key) {
+        this.clearUndo(true);                      // finalize any previous pending close first
+        const entry = BackgroundManager.getInstance().entry(key);
+        const timerId = setTimeout(() => {
+            if (this.undo?.key === key) {
+                this.undo = null;
+                // Undo window elapsed without an undo: commit the close as a full unpin.
+                try { BackgroundManager.getInstance().dockCloseFinal(key); } catch { }
+            }
+            this.refresh();
+        }, WebRTCbabycamDock.UNDO_TIMEOUT_MS);
+        this.undo = { key, name: entry?.friendlyName || entry?.entity || key, timerId };
+    }
+
+    clearUndo(finalize = false) {
+        if (!this.undo) return;
+        clearTimeout(this.undo.timerId);
+        if (finalize) {
+            const key = this.undo.key;
+            try { BackgroundManager.getInstance().dockCloseFinal(key); } catch { }
+        }
+        this.undo = null;
+    }
+
+    refresh() {
+        if (!this.rendered) return;
+        const manager = BackgroundManager.getInstance();
+        // A key with a pending close (undo window) is represented by the undo strip alone.
+        const chips = manager.snapshot().filter(c => c.key !== this.undo?.key);
+        const active = chips.length > 0 || !!this.undo;
+
+        this.toggleAttribute('active', active);
+        if (!active) {
+            this.expand(false);
+            return;
+        }
+
+        const order = ['error', 'blocked', 'expired', 'connecting', 'elsewhere', 'suspended', 'live'];
+        const worst = order.find(s => chips.some(c => c.state === s)) ?? 'live';
+        const count = this.shadowRoot.querySelector('.chip .count');
+        count.textContent = chips.length > 1 ? `${chips.length} cameras` : (chips[0]?.name ?? '');
+        this.shadowRoot.querySelector('.chip .dot').setAttribute('state', worst);
+
+        const esc = WebRTCbabycamDock.escape;
+        const openGlyph = '<svg viewBox="0 0 24 24"><path d="M12,10L8,14H11V20H13V14H16M19,4H5C3.89,4 3,4.9 3,6V18A2,2 0 0,0 5,20H9V18H5V8H19V18H15V20H19A2,2 0 0,0 21,18V6A2,2 0 0,0 19,4Z"/></svg>';
+        const closeGlyph = '<svg viewBox="0 0 24 24"><path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z"/></svg>';
+
+        let html = chips.map(c => {
+            const bodyAction = (c.state === 'blocked' || c.state === 'expired') ? 'resume' : 'return';
+            return `
+            <div class="row" role="listitem" data-key="${esc(c.key)}" state="${esc(c.state)}">
+                <span class="dot" state="${esc(c.state)}"></span>
+                <span class="name" data-action="${bodyAction}">${esc(c.name)}
+                    <span class="sub">${WebRTCbabycamDock.STATE_TEXT[c.state] ?? ''}</span></span>
+                <span class="iconbtn" data-action="return" title="Open camera view" role="button">${openGlyph}</span>
+                <span class="iconbtn" data-action="close" title="Stop background stream" role="button">${closeGlyph}</span>
+            </div>`;
+        }).join('');
+
+        if (this.undo) {
+            html += `
+            <div class="undo" data-key="${esc(this.undo.key)}">
+                <span class="name">${esc(this.undo.name)} stopped</span>
+                <button data-action="undo">UNDO</button>
+            </div>`;
+        }
+
+        this.shadowRoot.querySelector('.panel').innerHTML = html;
+
+        if (this.undo && !this.hasAttribute('expanded')) {
+            this.expand(true);                     // keep the UNDO reachable
+        }
+    }
+}
+
+if (!customElements.get('webrtc-babycam-dock')) customElements.define('webrtc-babycam-dock', WebRTCbabycamDock);
+
+// Boot the manager at SCRIPT LOAD, not first card connect: after a reload the current
+// dashboard may contain no babycam card, yet the dock must still offer the pinned
+// sessions ('suspended' chips) for return/reopen.
+try {
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => BackgroundManager.getInstance(), { once: true });
+    } else {
+        BackgroundManager.getInstance();
+    }
+} catch (err) {
+    console.warn('webrtc-babycam: background manager init failed', err);
 }
