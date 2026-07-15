@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.1';
+const CARD_VERSION = '2026.7.2';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -1181,6 +1181,7 @@ class WebRTCsession {
             startDate: now,
             reconnectDate: 0,
             signalingChannel: null,
+            clientConfiguration: null,
             peerConnection: null,
             localStream: null,
             remoteStream: null,
@@ -1359,12 +1360,17 @@ class WebRTCsession {
 
         const isStale = () => call.closed || call.id !== this.latestCallId || !this.state.calls.has(call.id);
 
-        // Historical default preserved for compatibility. ice_servers: [] disables STUN
-        // entirely (host candidates suffice for LAN peers and nothing pings Google);
-        // an array of RTCIceServer objects replaces it (own STUN/TURN for remote access).
+        // Precedence: explicit config.ice_servers always wins ([] disables STUN entirely:
+        // host candidates suffice for LAN peers and nothing pings Google). Otherwise use
+        // whatever the signaling channel advertised (camera/webrtc/get_client_config:
+        // HA-registered STUN/TURN, including HA Cloud). The historical Google-STUN
+        // default remains the fallback for channels that advertise nothing.
+        const advertisedIceServers = call.clientConfiguration?.iceServers;
         const iceServers = Array.isArray(config.ice_servers)
             ? config.ice_servers
-            : [{ urls: 'stun:stun.l.google.com:19302' }];
+            : (Array.isArray(advertisedIceServers) && advertisedIceServers.length
+                ? advertisedIceServers
+                : [{ urls: 'stun:stun.l.google.com:19302' }]);
         const rtcConfig = { iceServers };
         const pc = new RTCPeerConnection(rtcConfig);
 
@@ -1534,7 +1540,16 @@ class WebRTCsession {
         this.refreshHass();
         this.trace(`Opening ${config.url_type} signaling channel`);
 
-        if (config.url_type === 'go2rtc') {
+        if (config.url_type === 'hass') {
+            // Home Assistant's native camera WebRTC API (built-in go2rtc integration or
+            // any registered provider). `url` is intentionally ignored: signaling rides
+            // the card's existing authenticated HA connection.
+            if (config.entity && this.hass?.connection) {
+                url = `camera/webrtc:${config.entity}`;
+                signalingChannel = new HomeAssistantSignalingChannel(this.hass, config.entity);
+            }
+        }
+        else if (config.url_type === 'go2rtc') {
             if (config.url) {
                 let params = (new URL(config.url)).searchParams;
                 if (params.has('src'))
@@ -1675,6 +1690,9 @@ class WebRTCsession {
 
             await signalingChannel.open(WebRTCsession.SIGNALING_TIMEOUT_MS);
             if (signalingChannel.isOpen) {
+                // RTCConfiguration the server advertised during open (hass channel only);
+                // createPeer runs after this and prefers it over the Google-STUN default.
+                call.clientConfiguration = signalingChannel.clientConfiguration ?? null;
                 this.trace(`Opened '${url}'`);
             }
             else {
@@ -3482,8 +3500,14 @@ class WebRTCbabycam extends HTMLElement {
         if (!('RTCPeerConnection' in window) && (config.video !== false || config.audio !== false)) {
             throw new Error("Browser does not support WebRTC");
         }
-        if (!config.url || !config.entity) {
-            throw new Error("Missing `url` or `entity`");
+        if (!config.entity) {
+            throw new Error("Missing `entity`");
+        }
+        // 'hass' signaling rides the authenticated HA websocket and needs no url; every
+        // other (url-addressed) signaling type still requires one.
+        const urlType = config.url_type ?? 'webrtc-babycam';
+        if (urlType !== 'hass' && !config.url) {
+            throw new Error(`Missing \`url\` (required for url_type '${urlType}')`);
         }
         if (config.ptz && !config.ptz.service) {
             throw new Error("Missing `service` for `ptz`");
@@ -4991,6 +5015,166 @@ class Go2RtcSignalingChannel extends SignalingChannel {
             default:
                 return 'UNKNOWN';
         }
+    }
+}
+
+class HomeAssistantSignalingChannel extends SignalingChannel {
+    // Opt in per card with `url_type: hass` (`url` is then unused). Signals through Home
+    // Assistant's native camera WebRTC websocket API (camera/webrtc/get_client_config |
+    // offer | candidate), served by the built-in go2rtc integration or any other
+    // registered camera WebRTC provider. Rides the card's already-authenticated HA
+    // connection: no second websocket, no signed paths, no custom-component proxy.
+    // Requires HA 2024.11+ and a camera entity whose stream a provider supports.
+    //
+    // Caveat: HA's go2rtc provider re-ingests the camera's RTSP stream into its own
+    // go2rtc instance, which adds a hop and latency versus signaling straight to a
+    // go2rtc that already holds the stream. Frigate's own `enable_webrtc` avoids that
+    // hop but discards trickle ICE candidates entirely.
+    constructor(hass, entityId) {
+        super();
+        this.hass = hass;
+        this.entityId = entityId;
+        // RTCConfiguration advertised by the server via get_client_config; the session
+        // reads this after open() so createPeer can use HA-managed STUN/TURN.
+        this.clientConfiguration = null;
+        this.sessionId = null;
+        this._unsubPromise = null;
+        this._opened = false;
+        this._closed = false;
+        // Local candidates gathered before the server assigns a session_id; flushed on
+        // the 'session' event (same strategy as HA's own ha-web-rtc-player).
+        this._pendingLocalCandidates = [];
+    }
+
+    get isOpen() {
+        return this._opened && !this._closed;
+    }
+
+    async open(timeout) {
+        if (this._opened || this._closed) throw new Error('Signaling channel cannot be reopened');
+        if (!this.hass?.connection) throw new Error('Home Assistant connection is not available');
+
+        // Advisory fetch: a camera that rejects get_client_config will report the real,
+        // actionable error on the offer itself, so failure here only costs the advertised
+        // ICE servers - never the call.
+        try {
+            const response = await Promise.race([
+                this.hass.callWS({
+                    type: 'camera/webrtc/get_client_config',
+                    entity_id: this.entityId
+                }),
+                new Promise((_, reject) => setTimeout(
+                    () => reject(new Error(`get_client_config timed out after ${timeout}ms`)), timeout))
+            ]);
+            this.clientConfiguration = response?.configuration ?? null;
+        } catch (err) {
+            this.trace(`get_client_config failed: ${err.message}`);
+        }
+
+        this._opened = true;
+    }
+
+    close() {
+        if (this._closed) return;
+        this._closed = true;
+        this._pendingLocalCandidates = [];
+        const unsubPromise = this._unsubPromise;
+        this._unsubPromise = null;
+        if (unsubPromise) {
+            // Must stay synchronous (endCallFast runs inside pagehide): fire-and-forget.
+            // Unsubscribing closes the server-side session (camera.close_webrtc_session);
+            // when the page is going away the HA socket teardown performs the same cleanup.
+            unsubPromise.then(unsub => unsub()).catch(() => { });
+        }
+    }
+
+    async sendOffer(rtcSessionDescription) {
+        if (!this.isOpen) throw new Error('Cannot send offer because the signaling channel is not open');
+        if (this._unsubPromise) throw new Error('Offer already sent on this signaling channel');
+
+        // camera/webrtc/offer is a subscription: the command result acknowledges it, then
+        // events deliver session/answer/candidate/error. resubscribe:false because after
+        // an HA socket reconnect the server-side session is gone; the card's own watchdog
+        // restarts the call instead.
+        this._unsubPromise = this.hass.connection.subscribeMessage(
+            (event) => this.handleEvent(event),
+            {
+                type: 'camera/webrtc/offer',
+                entity_id: this.entityId,
+                offer: rtcSessionDescription.sdp
+            },
+            { resubscribe: false }
+        );
+        await this._unsubPromise;
+    }
+
+    async sendCandidate(rtcIceCandidate) {
+        if (!this.isOpen) throw new Error('Cannot send candidate because the signaling channel is not open');
+        // The native API has no end-of-candidates message; the server infers completion.
+        if (!rtcIceCandidate?.candidate) return;
+
+        if (!this.sessionId) {
+            this._pendingLocalCandidates.push(rtcIceCandidate);
+            this.trace('Queued local ICE candidate until session is established');
+            return;
+        }
+
+        try {
+            await this.hass.callWS({
+                type: 'camera/webrtc/candidate',
+                entity_id: this.entityId,
+                session_id: this.sessionId,
+                candidate: rtcIceCandidate.toJSON ? rtcIceCandidate.toJSON() : rtcIceCandidate
+            });
+        } catch (err) {
+            // A dropped candidate is non-fatal (remaining pairs usually still connect) and
+            // the call site does not await sendCandidate - trace instead of rejecting.
+            this.trace(`Failed to send ICE candidate: ${err.message}`);
+        }
+    }
+
+    handleEvent(event) {
+        if (this._closed) return;
+        switch (event?.type) {
+            case 'session': {
+                this.sessionId = event.session_id;
+                this.trace(`Session established: ${event.session_id}`);
+                for (const pendingCandidate of this._pendingLocalCandidates.splice(0)) {
+                    this.sendCandidate(pendingCandidate);
+                }
+                break;
+            }
+            case 'answer':
+                if (this.onanswer) {
+                    this.onanswer({ type: 'answer', sdp: event.answer });
+                }
+                break;
+            case 'candidate':
+                if (this.oncandidate) {
+                    const init = event.candidate;
+                    // Match ha-web-rtc-player: a provider may omit both sdpMid and
+                    // sdpMLineIndex, which addIceCandidate rejects - anchor to mid "0".
+                    const candidate = (init?.sdpMid ?? null) !== null || (init?.sdpMLineIndex ?? null) !== null
+                        ? init
+                        : { candidate: init?.candidate, sdpMid: '0' };
+                    this.oncandidate(candidate);
+                }
+                break;
+            case 'error':
+                if (this.onerror) {
+                    this.onerror(new Error(`${event.code}: ${event.message}`));
+                }
+                this.close();
+                break;
+            default:
+                this.trace(`Unhandled camera/webrtc event type: ${event?.type}`);
+                break;
+        }
+    }
+
+    trace(message) {
+        if (this.ontrace)
+            this.ontrace(message);
     }
 }
 
