@@ -1,0 +1,31 @@
+open:
+  name: Open
+  description: >
+    Open a fullscreen webrtc-babycam overlay on every connected browser.
+    All fields are forwarded verbatim to the card as its configuration.
+  fields:
+    entity:
+      name: Entity / stream
+      description: go2rtc stream name (or HA camera entity) to stream.
+      required: true
+      example: camera.doorbell_sub
+      selector:
+        text:
+    image_entity:
+      name: Image entity
+      description: HA camera entity used for still snapshots (poster) while connecting.
+      example: camera.doorbell
+      selector:
+        entity:
+          domain: camera
+    url:
+      name: URL
+      description: >
+        Signaling URL for a non-default direct url_type. Not used by the
+        integration-backed webrtc-babycam transport.
+      selector:
+        text:
+
+close:
+  name: Close
+  description: Close the fullscreen webrtc-babycam overlay on every connected browser.

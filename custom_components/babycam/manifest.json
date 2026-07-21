@@ -1,0 +1,14 @@
+{
+  "domain": "babycam",
+  "name": "Babycam",
+  "codeowners": ["@markfrancisonly"],
+  "config_flow": true,
+  "dependencies": ["http", "lovelace", "websocket_api"],
+  "documentation": "https://github.com/markfrancisonly/ha-babycam/",
+  "integration_type": "hub",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/markfrancisonly/ha-babycam/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "2026.7.17"
+}

@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.2';
+const CARD_VERSION = '2026.7.17';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -82,6 +82,10 @@ class WebRTCsession {
     static SIGNALING_TIMEOUT_MS = 10000;
     static ICE_TIMEOUT_MS = 10000;
     static RENDERING_TIMEOUT_MS = 10000;
+    // First-frame reveal gate: how long the video may stay hidden (snapshot
+    // showing) after 'playing' while waiting for rVFC proof of a painted
+    // frame before revealing regardless.
+    static REVEAL_TIMEOUT_MS = 3000;
     static IMAGE_FETCH_TIMEOUT_MS = 10000;
     static IMAGE_FETCH_INTERVAL_MS = 3000;
     static IMAGE_EXPIRY_MS = 30000;
@@ -123,6 +127,11 @@ class WebRTCsession {
         this.lastInterestDate = Date.now();
         this.lastTickDate = 0;
         this.parked = null;                  // background park reason: 'muted' | 'expired' | 'user' | null
+        // `start: image` opens in the snapshot loop (no WebRTC call) until a
+        // gesture goes live; the 'paused' gesture context (tap=go_live,
+        // double_tap=fullscreen) then owns the toggling. Initial state only:
+        // deliberately NOT part of the session key.
+        this.viewerPaused = config.start === 'image';
         this.mutedBackgroundSince = null;
         this.audioOnlyFailures = 0;          // consecutive failed audio-only (video-shed) calls
         this.ownerWindow = window;           // realm liveness check for the shared registry
@@ -169,6 +178,11 @@ class WebRTCsession {
         ];
         if (config.ice_servers) {
             try { variantParts.push(JSON.stringify(config.ice_servers)); } catch { }
+        }
+        // Same join-only-when-configured rule as ice_servers: existing installs
+        // keep their historical session keys (and stored background pins).
+        if (config.image_entity) {
+            variantParts.push(config.image_entity);
         }
         const variant = variantParts.join('|');
         let hash = 5381;
@@ -468,6 +482,30 @@ class WebRTCsession {
         this.lastInterestDate = Date.now();
     }
 
+    /**
+     * Viewer-requested image mode (gesture verbs go_image / go_live / toggle_live).
+     * Mirrors background parking: the play() tick keeps the image loop running but
+     * holds no WebRTC call while paused. Session-scoped by design — cards sharing
+     * this session (same key) pause and resume together.
+     */
+    setViewerPaused(paused) {
+        const next = !!paused;
+        // This is a never-stop-playing card first: freezing live video to a
+        // snapshot is UNSUPPORTED unless the card was configured image-first
+        // (start: image). The guard sits here, below every gesture verb and
+        // config, so no default, action mapping, or stray tap can stop a
+        // live-first stream. Resuming is always allowed.
+        if (next && this.config.start !== 'image') {
+            this.trace('Viewer pause refused: live-first card (start != image)');
+            return;
+        }
+        if (!!this.viewerPaused === next) return;
+        this.viewerPaused = next;
+        this.trace(next ? 'Viewer paused (image mode)' : 'Viewer resumed (live)');
+        this.noteInterest();
+        this.kick();
+    }
+
     relieveVideoPressure(force = false) {
         const next = force ? 0 : Math.max(0, this.videoPressure - 1);
         if (next === this.videoPressure && (!force || this.videoDeferredUntil === 0)) return false;
@@ -610,10 +648,13 @@ class WebRTCsession {
             this.imageLoop();
             this.evaluateBackground(now);
 
-            if (this.parked) {
-                // Background session parked (muted/expired): image loop only, no WebRTC.
+            if (this.parked || this.viewerPaused) {
+                // Parked (background) or viewer-paused (gesture go_image): image loop
+                // only, no WebRTC.
                 if (call) {
-                    this.trace(`Background parked (${this.parked}); stopping call`);
+                    this.trace(this.viewerPaused
+                        ? 'Viewer paused; stopping call'
+                        : `Background parked (${this.parked}); stopping call`);
                     await this.endCall(call);
                     call = null;
                 }
@@ -1099,7 +1140,11 @@ class WebRTCsession {
             entity: this.config.entity,
             friendlyName,
             returnPath: BackgroundManager.getInstance().currentPath(),
-            dock: this.config.dock !== false
+            dock: this.config.dock !== false,
+            // Full card config: what background resurrection rebuilds a
+            // session from after a page (re)load (plain lovelace config,
+            // JSON-safe by construction).
+            config: { ...this.config }
         };
     }
 
@@ -1560,18 +1605,15 @@ class WebRTCsession {
             }
         }
         else if (config.url_type === 'webrtc-babycam') {
-            // custom-component proxy
-            url = '/api/webrtc/ws?';
-            if (config.url)
-                url += '&url=' + encodeURIComponent(config.url);
-            if (config.entity)
-                url += '&entity=' + encodeURIComponent(config.entity);
+            // Babycam integration proxy. The upstream server is configured once in
+            // the integration, so cards only identify the go2rtc stream they need.
+            url = '/api/babycam/ws?' + new URLSearchParams({ entity: config.entity });
             const signature = await this.hass?.callWS?.({
                 type: 'auth/sign_path',
                 path: url
             });
             if (signature?.path) {
-                url = `ws${location.origin.substring(4)}${signature.path}`;
+                url = 'ws' + this.hass.hassUrl(signature.path).substring(4);
                 signalingChannel = new Go2RtcSignalingChannel(url);
             }
         }
@@ -1733,6 +1775,15 @@ class WebRTCsession {
                 url = entity?.attributes?.entity_picture;
             }
 
+            // Poster from a DIFFERENT HA entity than the stream source — for
+            // setups where `entity` is a go2rtc stream name with no HA entity
+            // behind it (e.g. camera.doorbell_sub), so entity_picture above
+            // resolves nothing and the card would sit black until WebRTC.
+            if (!url && config.image_entity && this.hass?.states && this.hass?.connected) {
+                const imageEntity = this.hass.states[config.image_entity];
+                url = imageEntity?.attributes?.entity_picture;
+            }
+
             if (!url && config.image_url) {
                 url = config.image_url;
             }
@@ -1869,6 +1920,7 @@ class WebRTCbabycam extends HTMLElement {
         this.lastMediaActivityDate = 0;
         this.lastActivitySample = null;
         this._fullscreenVideoOverride = false;
+        this._fullscreenResumedLive = false;
         this.lastError = null;
     }
 
@@ -1903,6 +1955,10 @@ class WebRTCbabycam extends HTMLElement {
         const { session } = this;
         if (show) {
             log.classList.remove('hidden');
+            // Interactive while visible so it can scroll on touch; taps still
+            // bubble to the card (a scroll drag raises pointercancel, so the
+            // gesture engine ignores it).
+            log.classList.add('pointerevents');
 
             if (!this._versionLogged) {
                 this._versionLogged = true;
@@ -1914,6 +1970,7 @@ class WebRTCbabycam extends HTMLElement {
         }
         else {
             log.classList.add('hidden');
+            log.classList.remove('pointerevents');
         }
     }
 
@@ -1994,6 +2051,9 @@ class WebRTCbabycam extends HTMLElement {
             }
             .media-container {
                 background: var(--primary-background-color);
+                /* No double-tap-zoom on the gesture surface (iOS Safari would
+                   consume double-taps and delay taps); scrolling still works. */
+                touch-action: manipulation;
             }
             video {
                 visibility: hidden;
@@ -2150,6 +2210,11 @@ class WebRTCbabycam extends HTMLElement {
             }
             .log.pointerevents {
                 pointer-events: all;
+                /* Drags scroll the log natively (vertical only); taps still
+                   bubble to the card's gesture engine. Don't chain scrolls
+                   to the dashboard behind the overlay. */
+                touch-action: pan-y;
+                overscroll-behavior: contain;
             }
         </style>
         <ha-card class="card">
@@ -2469,6 +2534,275 @@ class WebRTCbabycam extends HTMLElement {
         WebRTCbabycam.initialStaticSetupComplete = true;
     }
 
+    // ------------------------------------------------------------------
+    // Gesture actions: configurable tap / double_tap / hold (+ swipe in
+    // fullscreen) per context. Contexts: 'image' (snapshot mode), 'live'
+    // (streaming), 'fullscreen' (native element fullscreen OR the remote
+    // babycam overlay). config.actions.<context>.<gesture> overrides the
+    // defaults below; a verb may also be a standard HA action object.
+    // ------------------------------------------------------------------
+    // Freezing live video is UNSUPPORTED on live-first cards: this is a
+    // never-stop-playing card first (the babycam contract), and
+    // session.setViewerPaused refuses the pause direction unless the card
+    // is configured image-first (start: image). So the 'toggle_live'
+    // defaults below only ever stop video on start:image cards — on a
+    // live-first card a tap on live video does nothing.
+    // Double-tap is fullscreen in EVERY non-fullscreen context (and close
+    // within fullscreen) — one muscle memory everywhere.
+    static DEFAULT_GESTURES = {
+        image:      { tap: 'fetch_image', double_tap: 'fullscreen', hold: 'fullscreen' },
+        live:       { tap: 'toggle_live', double_tap: 'fullscreen', hold: 'toggle_mute' },
+        // paused = viewer tapped an image-first card into image mode; tap
+        // must resume (symmetric toggle). 'image' covers cards that are
+        // natively snapshot mode (still connecting, video/audio disabled),
+        // where tap refreshes.
+        paused:     { tap: 'go_live', double_tap: 'fullscreen', hold: 'fullscreen' },
+        fullscreen: { tap: 'close', double_tap: 'close', hold: 'none', swipe: 'close' },
+    };
+
+    get isInRemoteOverlay() {
+        return !!this.closest?.('#babycam-remote-overlay');
+    }
+
+    // Fullscreen ancestry must be computed on the COMPOSED tree:
+    // document.fullscreenElement retargets to the outermost shadow HOST
+    // (stack-in-card, hui-view, ...) when the fullscreened element lives in
+    // nested shadow roots, and Element.contains() does not pierce shadow
+    // boundaries — a naive check reports "not fullscreen" for a card
+    // fullscreened from inside card stacks, so in-fullscreen taps resolve
+    // to the live/paused context (pausing or reopening instead of closing).
+    isInFullscreen() {
+        const fsEl = document.fullscreenElement ?? document.webkitFullscreenElement;
+        if (!fsEl) return false;
+        let node = this;
+        while (node) {
+            if (node === fsEl) return true;
+            node = node.parentElement ?? node.getRootNode()?.host ?? null;
+        }
+        return false;
+    }
+
+    gestureContext() {
+        if (this.isInRemoteOverlay || this.isInFullscreen())
+            return 'fullscreen';
+        if (this.session?.viewerPaused) return 'paused';
+        return this.session?.isStreaming ? 'live' : 'image';
+    }
+
+    gestureFor(gesture, context = undefined) {
+        const ctx = context ?? this.gestureContext();
+        const conf = this.config?.actions?.[ctx] ?? {};
+        const def = WebRTCbabycam.DEFAULT_GESTURES[ctx] ?? {};
+        return conf[gesture] !== undefined ? conf[gesture] : def[gesture];
+    }
+
+    executeGestureAction(verb) {
+        if (!verb || verb === 'none') return;
+        if (typeof verb === 'object') { this.executeHaAction(verb); return; }
+        const session = this.session;
+        switch (verb) {
+            case 'fetch_image':
+                session?.noteInterest?.();
+                session?.fetchImage?.(0);
+                break;
+            case 'go_live':
+                session?.setViewerPaused?.(false);
+                this.expireConnectingGrace();
+                break;
+            case 'go_image':
+                session?.setViewerPaused?.(true);
+                break;
+            case 'toggle_live': {
+                // pause if currently streaming, resume if paused/idle
+                const pausing = session?.isStreaming === true;
+                session?.setViewerPaused?.(pausing);
+                if (!pausing) this.expireConnectingGrace();
+                break;
+            }
+            case 'fullscreen':
+            case 'toggle_fullscreen':
+                this.gestureFullscreen();
+                break;
+            case 'close':
+                this.gestureClose();
+                break;
+            case 'toggle_mute':
+                this.toggleVolume?.();
+                break;
+            case 'controls':
+                this.setControlsVisibility?.(true);
+                break;
+            case 'more_info': {
+                const entityId = this.config?.image_entity || this.config?.entity;
+                this.dispatchEvent(new CustomEvent('hass-more-info',
+                    { bubbles: true, composed: true, detail: { entityId } }));
+                break;
+            }
+            default:
+                this.trace?.(`Unknown gesture action: ${verb}`);
+        }
+    }
+
+    gestureFullscreen() {
+        if (this.isInRemoteOverlay) return;   // already effectively fullscreen
+
+        if (document.fullscreenEnabled || document.webkitFullscreenEnabled) {
+            this.toggleFullScreen();
+            return;
+        }
+
+        // iOS WKWebView: no element fullscreen API. Native video fullscreen
+        // (webkitEnterFullscreen) is only valid once loadedmetadata has
+        // fired — and a cold-starting WebRTC card cannot reach that without
+        // losing the tap's transient activation, so one tap can never do
+        // both. Media-ready videos get the native player; everything else
+        // (image-first cards, still connecting, video off) opens the card's
+        // own full-viewport overlay, which mounts synchronously inside the
+        // gesture and needs no media readiness.
+        const media = this.media;
+        if (this.config.video !== false
+            && typeof media?.webkitEnterFullscreen === 'function'
+            && media.readyState >= 1 && media.webkitSupportsFullscreen) {
+            try {
+                media.webkitEnterFullscreen();
+                return;
+            } catch (err) {
+                this.trace(`fullscreen: ${err.message}; falling back to overlay`);
+            }
+        }
+
+        const session = this.session;
+        const resumed = this.config.fullscreen === 'video' && session?.viewerPaused === true;
+        if (resumed) {
+            session.setViewerPaused(false);
+            this.expireConnectingGrace();
+        }
+        this.trace('fullscreen: full-viewport overlay');
+        window.babycamOverlay?.open?.(
+            { ...this.config },
+            { onclose: resumed ? () => session.setViewerPaused(true) : null }
+        );
+    }
+
+    gestureClose() {
+        if (this.isInRemoteOverlay) {
+            window.babycamOverlay?.close?.();
+            return;
+        }
+        const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+        if (fsEl) this.toggleFullScreen();
+    }
+
+    executeHaAction(a) {
+        try {
+            const act = a?.action;
+            if (act === 'perform-action' || act === 'call-service') {
+                const svc = a.perform_action || a.service;
+                const [domain, service] = svc.split('.');
+                this.hass?.callService(domain, service, a.data || a.service_data || {}, a.target);
+            }
+            else if (act === 'navigate' && a.navigation_path) {
+                history.pushState(null, '', a.navigation_path);
+                window.dispatchEvent(new CustomEvent('location-changed'));
+            }
+            else if (act === 'url' && a.url_path) {
+                window.open(a.url_path, '_blank');
+            }
+            else if (act === 'more-info') {
+                this.executeGestureAction('more_info');
+            }
+        }
+        catch (err) { this.trace?.(`ha_action failed: ${err.message}`); }
+    }
+
+    bindGestures(container) {
+        // Discrete UI elements own their own clicks — gestures must not fire
+        // when the event originated inside them.
+        const ignores = (ev) => {
+            const path = ev.composedPath ? ev.composedPath() : [];
+            return path.some(n => n instanceof Element && n.classList && (
+                n.classList.contains('ptz') || n.classList.contains('shortcuts')
+                || n.classList.contains('state')));
+        };
+
+        let holdTimer = null;
+        let holdFired = false;
+        let tapTimer = null;
+        let downPoint = null;
+
+        const dispatch = (gesture) => {
+            const verb = this.gestureFor(gesture);
+            if (verb) this.executeGestureAction(verb);
+        };
+
+        // Taps are synthesized from pointer events, NOT the browser 'click':
+        // iOS Safari delays click ~350ms (double-tap-zoom disambiguation),
+        // swallows the second tap of a double entirely (it zooms instead),
+        // and is unreliable for synthesized clicks in shadow DOM — so on
+        // WebKit a click-based tap/double-tap engine is dead on arrival.
+        // touch-action: manipulation on the container removes the zoom
+        // gesture (scrolling still works); pointerup + movement/duration
+        // thresholds do the rest identically on every engine. A drag that
+        // the browser claims for scrolling raises pointercancel and cleanly
+        // becomes no gesture.
+        container.addEventListener('pointerdown', (ev) => {
+            if (!ev.isPrimary || ignores(ev)) return;
+            holdFired = false;
+            clearTimeout(holdTimer);
+            holdTimer = setTimeout(() => { holdFired = true; dispatch('hold'); }, 600);
+            downPoint = { x: ev.clientX, y: ev.clientY, t: Date.now() };
+        });
+
+        const cancelHold = () => { clearTimeout(holdTimer); holdTimer = null; };
+        const cancelGesture = () => { cancelHold(); downPoint = null; };
+
+        container.addEventListener('pointerup', (ev) => {
+            cancelHold();
+            if (!ev.isPrimary || !downPoint) return;
+            const down = downPoint;
+            downPoint = null;
+            if (ignores(ev)) return;
+            if (holdFired) { holdFired = false; return; }
+            if (this.media?.controls) return;   // native controls own the surface
+
+            const dx = ev.clientX - down.x;
+            const dy = ev.clientY - down.y;
+            const dt = Date.now() - down.t;
+            const travel = Math.hypot(dx, dy);
+
+            // swipe (ANY direction): fullscreen context only (dashboards need
+            // scrolling). NOTE: needs touch-action:none on the surface or the
+            // browser claims the drag for scrolling and pointerup never fires
+            // with the delta — the remote overlay sets that inline.
+            if (this.gestureContext() === 'fullscreen' && dt < 600 && travel > 60) {
+                dispatch('swipe');
+                return;
+            }
+
+            if (travel > 12 || dt >= 600) return;   // drag or slow press, not a tap
+
+            const dbl = this.gestureFor('double_tap');
+            if (dbl && dbl !== 'none') {
+                // double-tap configured: tap pays the disambiguation delay
+                if (tapTimer) {
+                    clearTimeout(tapTimer); tapTimer = null;
+                    dispatch('double_tap');
+                }
+                else {
+                    tapTimer = setTimeout(() => { tapTimer = null; dispatch('tap'); }, 280);
+                }
+            }
+            else {
+                dispatch('tap');
+            }
+        });
+        container.addEventListener('pointercancel', cancelGesture);
+        container.addEventListener('pointerleave', cancelHold);
+
+        // mobile long-press must not open the browser context menu / image save
+        container.addEventListener('contextmenu', (ev) => { ev.preventDefault(); });
+    }
+
     renderInteractionEventListeners() {
         const container = this.shadowRoot.querySelector('.media-container');
         const image = this.shadowRoot.querySelector('.image');
@@ -2484,34 +2818,13 @@ class WebRTCbabycam extends HTMLElement {
                 this.setPTZVisibility(true);
         });
 
-        if (document.fullscreenEnabled || document.webkitFullscreenEnabled) {
-            this.onDoubleTap(container, () => this.toggleFullScreen());
-            this.onMouseDoubleClick(container, () => this.toggleFullScreen());
-        }
-        else if (this.config.video !== false && typeof this.media?.webkitEnterFullscreen === 'function') {
-            // iPhone Safari / iOS WebView: no element fullscreen API exists, but WebKit
-            // provides native video-only fullscreen. Exit is signaled by
-            // 'webkitendfullscreen', not document.fullscreenElement, so the
-            // fullscreen:'video' config upgrade path deliberately does not apply here.
-            this.onDoubleTap(container, () => {
-                try { this.media.webkitEnterFullscreen(); }
-                catch (err) { this.trace(`fullscreen: ${err.message}`); }
-            });
-        }
-
-        if (this.config.video === true) {
-            this.onMouseDownHold(container, () => this.setControlsVisibility(true), 800);
-            this.onTouchHold(container, () => this.setControlsVisibility(true), 800);
-        }
-
-        if (image) {
-            image.addEventListener('click', () => {
-                this.session?.noteInterest?.();
-                this.session?.fetchImage();
-            });
-            this.onMouseDownHold(image, () => this.session?.fetchImage(), 800, 1000);
-            this.onTouchHold(image, () => this.session?.fetchImage(), 800, 1000);
-        }
+        // Configurable gesture engine (tap / double_tap / hold / swipe per
+        // context) replaces the old hardcoded bindings: image click->fetch,
+        // container double-tap->fullscreen and hold->controls now route
+        // through config.actions with back-compatible-ish defaults (see
+        // DEFAULT_GESTURES). The iOS video-only fullscreen quirk lives in
+        // gestureFullscreen().
+        this.bindGestures(container);
 
         if (ptz) {
             ptz.addEventListener('click', ev => this.buttonClick(ev.target));
@@ -2947,6 +3260,22 @@ class WebRTCbabycam extends HTMLElement {
         }, Math.max(0, ms));
     }
 
+    // First-frame reveal gate bookkeeping (see the 'playing' handler).
+    // Cancelled ONLY at real media teardown (unload / 'emptied') — never from
+    // transient stalls: iOS Safari fires 'waiting' after 'playing' and may
+    // never fire 'playing' again for a MediaStream, so a stall-path cancel
+    // would strand the video hidden forever. reveal() self-guards against
+    // firing on torn-down media.
+    cancelPendingReveal() {
+        const media = this.media;
+        if (media && this.revealFrameCallbackId != null && typeof media.cancelVideoFrameCallback === 'function') {
+            try { media.cancelVideoFrameCallback(this.revealFrameCallbackId); } catch { }
+        }
+        this.revealFrameCallbackId = undefined;
+        clearTimeout(this.revealTimeoutId);
+        this.revealTimeoutId = undefined;
+    }
+
     stopVideoFrameMonitor() {
         const media = this.media;
         if (media && this.videoFrameCallbackId != null && typeof media.cancelVideoFrameCallback === 'function') {
@@ -3153,6 +3482,14 @@ class WebRTCbabycam extends HTMLElement {
         this.scheduleVideoFrameMonitor(true);
     }
 
+    expireConnectingGrace() {
+        // A deliberate go-live is the one moment the viewer EXPECTS progress
+        // feedback: backdate the wait window so the connecting spinner fades
+        // in immediately instead of after the tardy-connection grace.
+        this.playingWaitStartDate = Date.now() - WebRTCsession.RENDERING_TIMEOUT_MS;
+        this.refreshState();
+    }
+
     refreshState(reset = false) {
         const { session, media, config } = this;
         
@@ -3176,7 +3513,12 @@ class WebRTCbabycam extends HTMLElement {
         let show = undefined;
         let title = undefined;
 
-        if (session?.isVideoDeferred && session?.state?.image && !session?.activeCall) {
+        // Intentional image modes — the viewer parked on image (viewerPaused)
+        // or deferred video with a frame in hand — are not "waiting": the
+        // loading spinner means a wanted stream is failing, never a chosen
+        // snapshot.
+        if (session?.viewerPaused
+            || (session?.isVideoDeferred && session?.state?.image && !session?.activeCall)) {
             this.clearRefreshStateTimer();
             this.playingWaitStartDate = null;
             this.header = showStats ? (session?.state?.statistics ?? "") : "";
@@ -3289,9 +3631,8 @@ class WebRTCbabycam extends HTMLElement {
         if (lastTimestamp === String(data.timestamp) && (sameHash || !data.hash)) return;
 
         const lastSize = image.getAttribute('size');
-        if (lastSize) {
-            try { URL.revokeObjectURL(image.src); } catch { }
-        }
+        const previousUrl =
+            lastSize && image.src?.startsWith('blob:') ? image.src : null;
         image.setAttribute('size', data.size);
         
         const expiry = (data.timestamp ?? 0) + this.config.image_expiry;
@@ -3318,11 +3659,20 @@ class WebRTCbabycam extends HTMLElement {
 
         const objUrl = URL.createObjectURL(data.blob);
         image.src = objUrl;
-        // Do NOT revoke this blob on a timer: when images stop arriving (stream stale), that timer
-        // would revoke the URL the <img> is still displaying — blanking it to black instead of
-        // letting the stale image stay shown (blurred). The previous image's URL is already revoked
-        // when a new one replaces it (revoke-on-replace above), so at most one URL is ever held and
-        // the last frame remains valid for as long as it's on screen.
+        // Revoke the blob displaced on the PREVIOUS refresh, not this one:
+        // revoking the current bitmap before its replacement paints blanks
+        // the <img> to the container background (a white flash on the
+        // video -> image transition), and image.decode() is not a usable
+        // wait — WebKit re-rasterizes on decode(), flickering EVERY refresh.
+        // By the next refresh the prior swap has long painted, so the
+        // grandparent URL is always safe to release; at most two blob URLs
+        // are ever held. No timer-based revoke either: when images stop
+        // arriving (stream stale), that would blank the URL the <img> is
+        // still displaying instead of letting it stay shown (blurred).
+        if (this.displacedImageUrl && this.displacedImageUrl !== objUrl) {
+            try { URL.revokeObjectURL(this.displacedImageUrl); } catch { }
+        }
+        this.displacedImageUrl = previousUrl;
     }
     
     refreshVolume() {
@@ -3477,6 +3827,15 @@ class WebRTCbabycam extends HTMLElement {
                 session.config.video = true;
                 session.restartCall();
             }
+            // fullscreen: 'video' on an image-first card: entering fullscreen
+            // IS the go-live gesture — fullscreen always shows live video.
+            // The snapshot is restored on exit (fullscreenChanged, so Esc and
+            // system exits count) only when this transition started the video.
+            if (config.fullscreen === 'video' && session?.viewerPaused) {
+                this._fullscreenResumedLive = true;
+                session.setViewerPaused(false);
+                this.expireConnectingGrace();
+            }
         } else {
             try {
                 const exit = document.exitFullscreen ? document.exitFullscreen() : document.webkitExitFullscreen?.();
@@ -3503,10 +3862,10 @@ class WebRTCbabycam extends HTMLElement {
         if (!config.entity) {
             throw new Error("Missing `entity`");
         }
-        // 'hass' signaling rides the authenticated HA websocket and needs no url; every
-        // other (url-addressed) signaling type still requires one.
+        // Home Assistant-backed transports need no per-card URL. Direct transports
+        // remain available for advanced/standalone configurations.
         const urlType = config.url_type ?? 'webrtc-babycam';
-        if (urlType !== 'hass' && !config.url) {
+        if (!['hass', 'webrtc-babycam'].includes(urlType) && !config.url) {
             throw new Error(`Missing \`url\` (required for url_type '${urlType}')`);
         }
         if (config.ptz && !config.ptz.service) {
@@ -3525,6 +3884,8 @@ class WebRTCbabycam extends HTMLElement {
             "background": false,
             "fullscreen": null,
             "image_url": null,
+            "image_entity": null,
+            "actions": null,
             "image_interval": WebRTCsession.IMAGE_FETCH_INTERVAL_MS,
             "image_expiry": WebRTCsession.IMAGE_FETCH_INTERVAL_MS * WebRTCsession.IMAGE_EXPIRY_RETRIES,
             "allow_background": false,
@@ -3619,6 +3980,25 @@ class WebRTCbabycam extends HTMLElement {
     set hass(hass) {
         const session = this.session;
         if (session) session.hass = hass;
+    }
+
+    // Attach a never-visible card as its session's background designee — the
+    // resurrection entry point (BackgroundManager.resurrectSuspendedSessions).
+    // A from-birth-hidden card can't attach on its own: the
+    // IntersectionObserver reports not-intersecting and the proactive
+    // connect check requires this.session, which doesn't exist yet. Reuse
+    // setConfig's hidden-designee re-arm dance: the visible pass registers
+    // media handlers and loads the stream, the immediate hidden pass hands
+    // the card to designee state.
+    attachAsBackgroundDesignee() {
+        if (!this._cardConfig || this.session) return false;
+        const configClone = JSON.parse(JSON.stringify(this._cardConfig));
+        const session = WebRTCsession.getInstance(configClone);
+        if (!session.background) return false;
+        this._cardSession = session;
+        this.applyVisibility(true);
+        this.applyVisibility(false, true);
+        return true;
     }
 
     releaseOtherBackgroundCards()
@@ -3824,6 +4204,13 @@ class WebRTCbabycam extends HTMLElement {
 
     fullscreenChanged() {
         if (document.fullscreenElement) return;
+        // Restore the snapshot when leaving fullscreen ONLY if entering it is
+        // what started the video (fullscreen: 'video' on an image-first
+        // card). Runs here so Esc and system exits count, not just gestures.
+        if (this._fullscreenResumedLive) {
+            this._fullscreenResumedLive = false;
+            this.session?.setViewerPaused?.(true);
+        }
         const pending = this._pendingVisibility;
         this._pendingVisibility = null;
         if (pending == null || this.isVisibleInViewport === pending) return;
@@ -3907,6 +4294,10 @@ class WebRTCbabycam extends HTMLElement {
             const oldImage = this.shadowRoot.querySelector('.image');
             if (oldImage && oldImage.src && oldImage.src.startsWith('blob:')) {
                 try { URL.revokeObjectURL(oldImage.src); } catch { }
+            }
+            if (this.displacedImageUrl) {
+                try { URL.revokeObjectURL(this.displacedImageUrl); } catch { }
+                this.displacedImageUrl = undefined;
             }
             clearTimeout(this.imageRefreshTimeoutId);
             this.imageRefreshTimeoutId = undefined;
@@ -4021,6 +4412,10 @@ class WebRTCbabycam extends HTMLElement {
                     img.removeAttribute('hash');
                     img.removeAttribute('src');
                 }
+                if (this.displacedImageUrl) {
+                    try { URL.revokeObjectURL(this.displacedImageUrl); } catch { }
+                    this.displacedImageUrl = undefined;
+                }
             }
         }, 0);
     }
@@ -4051,6 +4446,7 @@ class WebRTCbabycam extends HTMLElement {
         const { media } = this;
         if (!media) return;
         this.stopVideoFrameMonitor();
+        this.cancelPendingReveal();
         this.setMediaStale(false);
         this.live(false);
         this.clearRefreshStateTimer();
@@ -4324,6 +4720,7 @@ class WebRTCbabycam extends HTMLElement {
         switch (ev.type) {
             case 'emptied':
                 this.stopVideoFrameMonitor();
+                this.cancelPendingReveal();
                 this.setMediaStale(false);
                 this.live(false);
                 media.removeAttribute('playing');
@@ -4406,24 +4803,74 @@ class WebRTCbabycam extends HTMLElement {
                     return;
                 }
 
-                if (audioTracks)
-                    media.setAttribute('playing', 'audiovideo');
-                else
-                    media.setAttribute('playing', 'video');
-        
-                const w = media.videoWidth || 0;
-                const h = media.videoHeight || 0;
-                let aspectRatio = 0;
-                if (h > 0) {
-                    aspectRatio = (w / h).toFixed(4);
+                // Don't reveal on 'playing' alone: a WebRTC receiver track can
+                // enter playback while still waiting on its first keyframe
+                // (slow-waking doorbells), and the revealed element paints
+                // opaque black over the snapshot until a frame decodes. Gate
+                // the reveal on proof of a decoded frame — rVFC where the
+                // engine delivers it for MediaStreams, a decoded-frame-counter
+                // poll where it doesn't (iOS Safari), and a hard cap so the
+                // video can never stay hidden on a silent engine. A stall
+                // recovery ('playing' refiring on already-visible video)
+                // reveals immediately: the gate only ever REPLACES black with
+                // the snapshot, never delays a real frame.
+                const reveal = () => {
+                    this.cancelPendingReveal();
+
+                    if (!session || session.isTerminated) return;
+                    if (this.media !== media || !media.srcObject?.getVideoTracks?.().length) return;
+                    if (media.getAttribute('playing') === 'paused') return;
+
+                    if (audioTracks)
+                        media.setAttribute('playing', 'audiovideo');
+                    else
+                        media.setAttribute('playing', 'video');
+
+                    const w = media.videoWidth || 0;
+                    const h = media.videoHeight || 0;
+                    let aspectRatio = 0;
+                    if (h > 0) {
+                        aspectRatio = (w / h).toFixed(4);
+                    }
+                    media.setAttribute("aspect-ratio", aspectRatio);
+                    media.style.setProperty(`--video-aspect-ratio`, `${aspectRatio}`);
+                    this.noteMediaActivity(true);
+
+                    this.live(true);
+                    this.refreshState();
+                    this.refreshVolume();
+                };
+
+                // videoWidth > 0 means frame data already exists (metadata from
+                // real frames) — reveal immediately. Only a genuinely frameless
+                // track (Chromium pre-keyframe) defers, and only until rVFC
+                // proves a painted frame or the hard cap lands. Engines that
+                // never deliver rVFC for MediaStreams (iOS Safari) ride the
+                // cap; nothing here can strand the reveal.
+                const alreadyVisible = ['audiovideo', 'video'].includes(media.getAttribute('playing'));
+                if (alreadyVisible || media.videoWidth > 0) {
+                    reveal();
+                    break;
                 }
-                media.setAttribute("aspect-ratio", aspectRatio);
-                media.style.setProperty(`--video-aspect-ratio`, `${aspectRatio}`);
-                this.noteMediaActivity(true);
-        
-                this.live(true);
-                this.refreshState(); 
-                this.refreshVolume();
+
+                this.cancelPendingReveal();
+                this.trace('Deferring video reveal until first decoded frame');
+                if (typeof media.requestVideoFrameCallback === 'function') {
+                    try {
+                        this.revealFrameCallbackId = media.requestVideoFrameCallback(() => {
+                            this.revealFrameCallbackId = undefined;
+                            this.trace('Video revealed on first presented frame');
+                            reveal();
+                        });
+                    } catch {
+                        this.revealFrameCallbackId = undefined;
+                    }
+                }
+                this.revealTimeoutId = setTimeout(() => {
+                    this.revealTimeoutId = undefined;
+                    this.trace('Video revealed on reveal timeout');
+                    reveal();
+                }, WebRTCsession.REVEAL_TIMEOUT_MS);
                 break;
 
             case 'timeupdate':
@@ -4525,8 +4972,10 @@ const customCardRegistrationFinal = {
     preview: false,
     description: `WebRTC babycam provides a lag-free 2-way audio, video, and image camera card. (v${CARD_VERSION})`
 };
-if (window.customCards) window.customCards.push(customCardRegistrationFinal);
-else window.customCards = [customCardRegistrationFinal];
+window.customCards = window.customCards || [];
+if (!window.customCards.some(card => card.type === customCardRegistrationFinal.type)) {
+    window.customCards.push(customCardRegistrationFinal);
+}
 
 
 // Signaling Channel classes:
@@ -5023,7 +5472,7 @@ class HomeAssistantSignalingChannel extends SignalingChannel {
     // Assistant's native camera WebRTC websocket API (camera/webrtc/get_client_config |
     // offer | candidate), served by the built-in go2rtc integration or any other
     // registered camera WebRTC provider. Rides the card's already-authenticated HA
-    // connection: no second websocket, no signed paths, no custom-component proxy.
+    // connection: no second websocket, no signed paths, no custom-integration proxy.
     // Requires HA 2024.11+ and a camera entity whose stream a provider supports.
     //
     // Caveat: HA's go2rtc provider re-ingests the camera's RTSP stream into its own
@@ -5387,6 +5836,7 @@ class BackgroundManager {
             // path with wherever the dock happened to be clicked; noteCardVisible keeps
             // the path fresh from the card's actual view.
             if (meta.returnPath && enabled && !e.returnPath) e.returnPath = meta.returnPath;
+            if (meta.config) e.config = meta.config;
             if (meta.dock === false) e.dock = false; else delete e.dock;
             e.lastAliveAt = Date.now();
             if (enabled && !before) e.startedAt = Date.now();
@@ -5394,6 +5844,7 @@ class BackgroundManager {
         });
         this.dispatchBackgroundEvent(key, enabled);
         this.broadcast({ type: 'set-enabled', key, enabled });
+        if (!enabled) document.querySelector(`div[data-babycam-background-host="${key}"]`)?.remove();
         this.refreshDock();
     }
 
@@ -5633,6 +6084,9 @@ class BackgroundManager {
                     e.returnPath = meta.returnPath;
                     if (!e.entity) e.entity = meta.entity;
                     if (meta.friendlyName) e.friendlyName = meta.friendlyName;
+                    // keep the resurrection config fresh: card edits since the
+                    // pin (or a pre-config-persistence pin) land here
+                    if (meta.config) e.config = meta.config;
                     e.lastAliveAt = Date.now();
                     delete e.legacy;
                 }
@@ -5689,7 +6143,48 @@ class BackgroundManager {
             session.unpark();
             session.kick();
         }
+        else {
+            // reload with no session yet: the chip tap is a user gesture, so
+            // the resurrected stream starts with activation in hand
+            this.resurrectSuspendedSessions();
+        }
         this.refreshDockThrottled();
+    }
+
+    async resurrectSuspendedSessions() {
+        // Pinned background streams survive a page (re)load: mount an
+        // offscreen host card from the registry's stored config for every
+        // enabled entry with no session, and hand it straight to designee
+        // state (offscreen — NOT hidden-in-place — so the card reads as
+        // not-visible and stays on the background path). Kiosks with
+        // autoplay allowances resume hands-off; restricted browsers park
+        // 'muted' loudly in the dock, one tap from live.
+        this.loadRegistry();
+        const wanted = Object.entries(this.registry).filter(([key, e]) =>
+            e?.enabled === true && e.config && !WebRTCsession.sessions.get(key));
+        if (!wanted.length) return;
+
+        // the resource loads before the frontend's hass settles
+        for (let i = 0; i < 240 && !WebRTCsession.resolveHass(); i++) {
+            await new Promise(r => setTimeout(r, 500));
+        }
+        if (!WebRTCsession.resolveHass()) return;
+
+        for (const [key, e] of wanted) {
+            if (WebRTCsession.sessions.get(key)) continue;   // a real card won the race
+            try {
+                const host = document.createElement('div');
+                host.dataset.babycamBackgroundHost = key;
+                host.style.cssText = 'position:fixed;left:-10000px;top:0;width:1px;height:1px;overflow:hidden;';
+                const card = document.createElement('webrtc-babycam');
+                card.setConfig({ ...e.config });
+                host.appendChild(card);
+                document.body.appendChild(host);
+                card.attachAsBackgroundDesignee();
+            } catch (err) {
+                console.warn('babycam: background resurrection failed for', key, err);
+            }
+        }
     }
 
     dockClose(key) {
@@ -6271,3 +6766,121 @@ try {
 } catch (err) {
     console.warn('webrtc-babycam: background manager init failed', err);
 }
+// ---------------------------------------------------------------------------
+// Remote fullscreen overlay — driven by the Babycam custom integration.
+// `babycam.open` / `babycam.close` service calls fire `babycam_open` /
+// `babycam_close` events on the HA bus; every browser that has this resource
+// loaded (resource-loader puts it on all dashboards) shows/hides a fullscreen
+// webrtc-babycam overlay. Replaces browser_mod popups: true 100% viewport
+// height, above all app chrome. Clicking the overlay closes it locally
+// (matching the old popup's click_close behavior); the service close removes
+// it everywhere.
+// ---------------------------------------------------------------------------
+(function () {
+    const OVERLAY_ID = 'babycam-remote-overlay';
+    let overlay = null;
+    let hassPump = null;
+
+    function getHass() {
+        return document.querySelector('home-assistant')?.hass;
+    }
+
+    let overlayOnClose = null;
+
+    function closeOverlay() {
+        if (hassPump) { clearInterval(hassPump); hassPump = null; }
+        if (overlay) { overlay.remove(); overlay = null; }
+        const cb = overlayOnClose;
+        overlayOnClose = null;
+        try { cb?.(); } catch { }
+    }
+
+    function openOverlay(config, opts) {
+        closeOverlay();
+        if (!config || !config.entity) return;
+
+        overlay = document.createElement('div');
+        overlay.id = OVERLAY_ID;
+        // touch-action:none — the overlay owns ALL touch gestures (swipe-to-close);
+        // without it the webview claims drags for scrolling and swipes never land.
+        overlay.style.cssText =
+            'position:fixed;inset:0;z-index:2147483000;background:#000;' +
+            'display:flex;align-items:center;justify-content:center;' +
+            'touch-action:none;overscroll-behavior:none;';
+
+        const card = document.createElement('webrtc-babycam');
+        card.style.cssText = 'width:100%;height:100%;touch-action:none;';
+        try {
+            card.setConfig(config);
+        } catch (err) {
+            console.warn('babycam overlay: bad config', err);
+            overlay = null;
+            return;
+        }
+        card.hass = getHass();
+        overlay.appendChild(card);
+
+        // click_close parity with the old browser_mod popup
+        overlay.addEventListener('click', (ev) => {
+            if (ev.target === overlay) closeOverlay();
+        });
+
+        // armed only after a successful mount: a bad-config bail above must
+        // not leave a stale callback for a future close
+        overlayOnClose = opts?.onclose ?? null;
+        document.body.appendChild(overlay);
+
+        // keep the card's hass reference fresh while the overlay lives
+        hassPump = setInterval(() => {
+            const h = getHass();
+            if (h && overlay) card.hass = h;
+        }, 1000);
+    }
+
+    async function subscribe() {
+        // wait for the frontend's hass connection (resource loads early)
+        for (let i = 0; i < 240; i++) {
+            const conn = getHass()?.connection;
+            if (conn) {
+                // Component-owned subscription command: non-admin users (wallpanels)
+                // cannot subscribe to arbitrary bus events, so the babycam component
+                // forwards open/close through babycam/subscribe (auth, not admin).
+                // subscribeMessage re-subscribes automatically on reconnect.
+                conn.subscribeMessage(
+                    (msg) => {
+                        if (msg?.event_type === 'babycam_open') openOverlay(msg.data || {});
+                        else if (msg?.event_type === 'babycam_close') closeOverlay();
+                    },
+                    { type: 'babycam/subscribe' }
+                ).catch((err) => console.warn('babycam overlay: subscribe failed', err));
+                return;
+            }
+            await new Promise((r) => setTimeout(r, 500));
+        }
+        console.warn('babycam overlay: no hass connection; remote open/close inactive');
+    }
+    subscribe();
+
+    // Pinned background streams survive page (re)loads: rebuild their
+    // sessions from the registry's stored configs (see BackgroundManager.
+    // resurrectSuspendedSessions — no-op when every pin has a session).
+    BackgroundManager.getInstance().resurrectSuspendedSessions();
+
+    // Card gesture verbs ('close' in fullscreen context, local 'fullscreen'
+    // escalation) need programmatic access to the overlay.
+    window.babycamOverlay = { open: openOverlay, close: closeOverlay };
+
+    // LOCAL open from any dashboard card (this browser only — unlike the
+    // babycam.open service, which broadcasts to every browser):
+    //   tap_action:
+    //     action: fire-dom-event
+    //     babycam: { url: ..., entity: camera.x, ... }   # card config
+    // fire-dom-event dispatches 'll-custom' with the action object as detail.
+    // { babycam: "close" } (or {action: 'close'}) closes instead.
+    window.addEventListener('ll-custom', (ev) => {
+        const cfg = ev.detail?.babycam;
+        if (!cfg) return;
+        if (cfg === 'close' || cfg.action === 'close') closeOverlay();
+        else openOverlay(cfg);
+    });
+})();

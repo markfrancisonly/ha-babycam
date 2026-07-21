@@ -37,34 +37,61 @@ Additionally, background audio features allow you to monitor your baby on your i
   
 ## Installation
 
-1. Copy `webrtc-babycam.js` into your `www` folder.
-2. Add it as a resource in your Lovelace dashboard, with a cache-busting version query:
+### HACS
+
+1. In HACS, add `https://github.com/markfrancisonly/ha-babycam` as a custom
+   **Integration** repository, then install **WebRTC Babycam**.
+2. Restart Home Assistant.
+3. Add **Babycam** under Settings → Devices & services → Add integration. Enter
+   a go2rtc websocket base address reachable from Home Assistant, such as
+   `ws://go2rtc-host:1984` (do not add
+   `/api/ws`).
+
+For a manual install, copy `custom_components/babycam` to
+`config/custom_components/babycam`, restart Home Assistant, and complete step 3.
+
+The integration bundles the card: it serves `webrtc-babycam.js` itself and
+registers it as a dashboard resource automatically. The card is served with
+`Cache-Control: no-cache` and validators, so a plain dashboard reload always
+picks up an updated card (a cheap 304 when nothing changed) — no version
+query, no Home Assistant restart, no `www` copy, and no manual resource
+entry.
+
+### Upgrading from the frontend-only card
+
+Remove the old `/local/webrtc-babycam.js` dashboard resource after installing
+the integration, and remove any separately copied `www/webrtc-babycam.js` file.
+Keeping both resources can load two versions of the card. Existing card YAML
+continues to work; when using the default `url_type: webrtc-babycam`, remove the
+per-card `url` because the integration now owns the go2rtc server address.
+
+If your dashboards are in **YAML mode**, resources are user-managed — add it
+yourself (the integration logs the exact line at startup):
 
 ```yaml
 resources:
-- url: /local/webrtc-babycam.js?v=2026.7.1
-  type: module
-
+  - url: /babycam/webrtc-babycam.js
+    type: module
 ```
 
-Browsers (especially wall tablets) cache card code aggressively — bump the `?v=` value
-whenever you update the file. To confirm which version is actually running, check the
-browser console banner, or enable the debug overlay (`Shift+D` or `?debug`) on any card:
-the first log line shows the loaded version.
+To confirm which version is actually running, check the browser console
+banner, or enable the debug overlay (`Shift+D` or `?debug`) on any card: the
+first log line shows the loaded version.
  
 ## Configuration
 
 | **Name** | **Type** | **Default** | **Supported Options** | **Description** |
 |----------|----------|-------------|----------------------|----------------|
-| **entity** | `string` | **Required** | Camera entity ID, e.g. `camera.front_door` | The Home Assistant camera entity to use. Used for `entity_picture` (fallback) or passing along an identifier to the signaling server. |
-| **url** | `string` | **Required** | Any valid HTTP(s) or WebSocket URL | Base or direct URL for the WebRTC signaling or camera feed, e.g., `go2rtc` or `RTSPtoWeb` server URL. |
-| **url_type** | `string` | `"webrtc-babycam"` | `"webrtc-babycam"`, `"go2rtc"`, `"webrtc-camera"`, `"whep"`, `"rtsptoweb"` | Determines which signaling approach/class is used. |
+| **entity** | `string` | **Required** | go2rtc stream name or camera entity ID | The stream passed to go2rtc. If it is also a Home Assistant entity, its `entity_picture` is used as the snapshot fallback. |
+| **url** | `string` | (optional) | Any valid HTTP(s) or WebSocket URL | Not used by the default integration proxy. Required only for direct `go2rtc`, `webrtc-camera`, `whep`, or `rtsptoweb` transports. |
+| **url_type** | `string` | `"webrtc-babycam"` | `"webrtc-babycam"`, `"hass"`, `"go2rtc"`, `"webrtc-camera"`, `"whep"`, `"rtsptoweb"` | Determines which signaling approach/class is used. |
 | **video** | `boolean` | `true` | `true`, `false` | Enable (receive) video track. If `false`, video is disabled (audio-only or still images). |
 | **audio** | `boolean` | `true` | `true`, `false` | Enable (receive) audio track. If `false`, audio is disabled entirely. |
+| **start** | `string` | `live` | `live`, `image` | `image` opens the card in the snapshot loop (no WebRTC call) until a gesture goes live — tap then toggles image ↔ live and double-tap enters fullscreen. **Only `start: image` cards can be toggled back to a snapshot**: on live-first cards (the default) freezing video is unsupported — no gesture or action can stop a playing stream. Initial state only; not part of the session key. |
 | **muted** | `boolean` | `true` | `true`, `false` | Mute the player element on load. If `false`, the player attempts to play with audio enabled, but browsers often require user interaction to unmute. |
 | **microphone** | `boolean` | `false` | `true`, `false` | Enable *two-way audio* from the user’s microphone to the camera feed if the browser permits. |
 | **background** | `boolean` | `false` | `true`, `false` | If `true`, enables "background mode," where the audio continues to play when off-screen. |
-| **fullscreen** | `string` | (optional)  | `"video"`, `null` | Controls whether entering fullscreen enables video. `"video"` automatically enables video when fullscreen. |
+| **fullscreen** | `string` | (optional)  | `"video"`, `null` | `"video"` makes fullscreen always show live video: on a `video: false` card the fullscreen call is upgraded to video, and on a `start: image` card entering fullscreen goes live (the snapshot is restored on exit if fullscreen is what started the video). Omit it to let snapshot cards go fullscreen as a static image. |
 | **debug** | `boolean` | `false` | `true`, `false` | Enables verbose logging. Shows a translucent debug panel capturing debug/tracing messages. |
 | **stats** | `boolean` | `false` | `true`, `false` | Enables measurement and display of streaming stats (e.g., framerate, bandwidth). |
 | **allow_background** | `boolean` | `false` | `true`, `false` | If `true`, allows toggling the “pin” icon to enable background mode. |
@@ -79,6 +106,8 @@ the first log line shows the loaded version.
 | **fps** | `number` | (optional) | Any numeric FPS value | A numeric hint for frames per second (FPS) used to estimate "render quality" in stats. If `null`, auto-detects FPS. |
 | **ice_servers** | `array` | (optional) | Array of `RTCIceServer` objects, or `[]` | Replaces the built-in Google STUN default. Use `[]` on LAN-only setups (host candidates suffice; nothing contacts Google), or supply your own STUN/TURN servers for remote access. |
 | **image_url** | `string` | (optional)  | Any valid image URL | Custom URL for still snapshots when video is not playing. |
+| **image_entity** | `string` | (optional)  | Any HA camera entity id | Fetch still snapshots from this entity's `entity_picture` when `entity` has no HA entity behind it (e.g. `entity` is a go2rtc stream name like `camera.doorbell_sub`). Poster priority: `entity` → `image_entity` → `image_url`. |
+| **actions** | `object` | (optional) | Per-context gesture map | Configurable gestures: `actions.<context>.<gesture>` where context ∈ `image` \| `live` \| `fullscreen` and gesture ∈ `tap` \| `double_tap` \| `hold` (+ `swipe`, any direction, fullscreen only). Verbs: `fetch_image`, `go_live`, `go_image`, `toggle_live`, `fullscreen`, `toggle_fullscreen`, `close`, `toggle_mute`, `controls`, `more_info`, `none`, or a standard HA action object (`{action: perform-action \| navigate \| url \| more-info, ...}`). Defaults — image: tap `fetch_image`, double_tap `toggle_live`, hold `fullscreen`; live: tap `toggle_live`, double_tap `fullscreen`, hold `toggle_mute`; fullscreen: tap/double_tap/swipe `close`. Taps pay a ~280 ms disambiguation delay only in contexts where a double_tap is configured. |
 | **image_interval** | `number` | `3000` (default) | Any numeric value in milliseconds | Interval (in ms) for fetching a new still image when video is not playing. |
 | **image_expiry** | `number` | `15000` (default) | Any numeric value in milliseconds | Time (in ms) before an image is considered expired or blurred. |
 | **ptz** | `object` | (optional)  | PTZ service call object | Specifies *Pan/Tilt/Zoom* service calls. Example: `{ service: 'camera.ptz', data_up: {...} }`. |
@@ -93,14 +122,89 @@ Create a card in Lovelace:
 ```yaml
 type: custom:webrtc-babycam
 entity: camera.living_room
-url: "http://your_webrtc_endpoint"
 audio: true
 video: true
-unmuted: true
+muted: false
 microphone: false
 allow_background: true
 ```
 
+
+### Gesture actions
+
+Gestures are configurable per **context** — what the card is currently showing:
+
+- `image` — natively snapshot mode (still connecting, or video/audio disabled)
+- `live` — WebRTC streaming
+- `paused` — viewer tapped a live card into image mode (`toggle_live`/`go_image`)
+- `fullscreen` — native element fullscreen **or** the remote overlay
+
+Gestures: `tap`, `double_tap`, `hold` everywhere, plus `swipe` (any direction)
+in fullscreen only (embedded swipes would fight dashboard scrolling).
+
+Verbs: `fetch_image`, `go_live`, `go_image`, `toggle_live`, `fullscreen`,
+`toggle_fullscreen`, `close`, `toggle_mute`, `controls`, `more_info`, `none`,
+or a standard HA action object (`{action: perform-action | navigate | url | more-info, ...}`).
+
+Defaults:
+
+```yaml
+actions:
+  image:      { tap: fetch_image, double_tap: toggle_live, hold: fullscreen }
+  live:       { tap: toggle_live, double_tap: fullscreen,  hold: toggle_mute }
+  paused:     { tap: go_live, double_tap: fullscreen, hold: fullscreen }
+  fullscreen: { tap: close, double_tap: close, hold: none, swipe: close }
+```
+
+Notes: taps pay a ~280 ms disambiguation delay only in contexts where a
+`double_tap` is configured; gestures stand down while native video controls
+are visible; `toggle_live` is session-scoped (cards sharing a stream pause and
+resume together) and keeps the snapshot loop polling while paused.
+
+### Babycam custom integration (fullscreen overlay + go2rtc proxy)
+
+The repo ships `custom_components/babycam` (successor to the local AlexxIT
+`webrtc` fork; domain `babycam`, API paths `/api/babycam/*` so it coexists
+with that integration and HA's built-in go2rtc):
+
+- **Signaling proxy** — the card's default `url_type: webrtc-babycam` signs
+  and connects through `/api/babycam/ws`, which proxies to the go2rtc server
+  configured in the integration's config entry (a `ws(s)://` URL).
+- **`babycam.open` / `babycam.close` services** — open/close a **fullscreen
+  overlay on every connected browser** (true 100% viewport, above all app
+  chrome). All service fields are forwarded verbatim as the card config —
+  `entity` (stream), `image_entity`, `actions`, etc. Non-admin browsers receive
+  events via the integration's
+  `babycam/subscribe` websocket command (arbitrary bus-event subscriptions
+  are admin-only in HA).
+
+```yaml
+# e.g. a doorbell automation
+- action: babycam.open
+  data:
+    entity: camera.doorbell_sub
+    image_entity: camera.doorbell     # instant poster
+- delay: 15
+- action: babycam.close
+```
+
+### Local fullscreen from any dashboard card
+
+To open the overlay **on this browser only** (unlike the broadcast service),
+use `fire-dom-event` from any card — no browser_mod required:
+
+```yaml
+type: picture-entity
+entity: camera.front_yard
+tap_action:
+  action: fire-dom-event
+  babycam:
+    entity: camera.front_yard
+```
+
+`babycam: close` (or `babycam: {action: close}`) closes it. Inside the
+overlay, the card's `fullscreen` gesture context applies — tap or swipe
+closes by default.
 
 ### PTZ & Shortcuts (Optional)
 

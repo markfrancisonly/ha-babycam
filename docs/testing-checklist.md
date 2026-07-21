@@ -6,11 +6,12 @@ the highest-risk changes are exercised first.
 
 ## Setup
 
-1. Copy the updated `js/webrtc-babycam.js` to `www/` and **bump the `?v=` on the resource
-   URL** (or hard-reload with DevTools open and "Disable cache" checked).
-2. Confirm the load: the console banner must read `WebRTC Babycam v2026.7.1`.
+1. Install/update `custom_components/babycam`, restart Home Assistant, and confirm
+   `/babycam/webrtc-babycam.js?v=2026.7.2` is the only Babycam dashboard resource
+   (or hard-reload with DevTools open and "Disable cache" checked).
+2. Confirm the load: the console banner must read `WebRTC Babycam v2026.7.2`.
 3. Enable tracing: append `?debug` to the dashboard URL, or press `Shift+D` on the
-   dashboard. The overlay's first line shows `webrtc-babycam v2026.7.1` — if the version
+   dashboard. The overlay's first line shows `webrtc-babycam v2026.7.2` — if the version
    is missing or old, you are testing cached code; stop and fix that first.
 4. Useful trace lines referenced below: `STATE <status>`, `Background parked: <reason>`,
    `Background unparked`, `Play watchdog starved <n>ms`, `Holding background stream as
@@ -21,7 +22,6 @@ Suggested card config for most tests:
 ```yaml
 type: custom:webrtc-babycam
 entity: camera.<your_cam>
-url: "<your endpoint>"
 allow_background: true
 debug: true
 ```
