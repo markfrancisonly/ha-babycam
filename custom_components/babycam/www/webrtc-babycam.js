@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.19';
+const CARD_VERSION = '2026.7.21';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -4630,6 +4630,13 @@ class WebRTCbabycam extends HTMLElement {
         else if (media.classList.contains('unmute-pending')) {
             mute = false;
         }
+        else if (WebRTCsession.unmuteEnabled && this.session?.shouldKeepBackgroundAudio) {
+            // A rebuilt background-audio stream (dock tap after a muted park)
+            // gets a FRESH media element: the unmute event fired before it
+            // existed, so without this it plays muted forever and re-parks.
+            // Global unmute is already granted — play audible.
+            mute = false;
+        }
 
         if (!mute && !WebRTCsession.unmuteEnabled)
         {
@@ -6081,9 +6088,17 @@ class BackgroundManager {
             this.writeRegistry(reg => {
                 const e = reg[session.key];
                 if (e) {
-                    // last-visible moment beats pin-time capture: 'return' goes where the
-                    // user actually was, even if they pinned on a different dashboard
-                    e.returnPath = meta.returnPath;
+                    // last-visible moment beats pin-time capture: 'return' goes
+                    // where the user actually was, even if they pinned on a
+                    // different dashboard. ONLY a card the viewer can actually
+                    // SEE may refresh it: synthetic visible passes (the
+                    // hidden-designee re-arm dance, background resurrection)
+                    // would clobber the path with wherever the page happens to
+                    // be — leaving the dock's return shortcut pointing at the
+                    // current view, a silent no-op.
+                    if (card.isVisibleInViewport) {
+                        e.returnPath = meta.returnPath;
+                    }
                     if (!e.entity) e.entity = meta.entity;
                     if (meta.friendlyName) e.friendlyName = meta.friendlyName;
                     // keep the resurrection config fresh: card edits since the
@@ -6115,24 +6130,50 @@ class BackgroundManager {
     }
 
     navigate(path) {
-        // HA frontend convention (src/common/navigate.ts): pushState then a plain
-        // 'location-changed' Event on the main window with detail as an expando.
+        // HA frontend convention (src/common/navigate.ts): pushState on the
+        // window hosting HA, then 'location-changed' as a CustomEvent — the
+        // same shape the card's own HA-action handler uses.
         try {
             this.root.history.pushState(null, '', path);
-            const ev = new Event('location-changed', { bubbles: true, composed: true });
-            ev.detail = { replace: false };
-            this.root.dispatchEvent(ev);
+            this.root.dispatchEvent(
+                new CustomEvent('location-changed', {
+                    bubbles: true,
+                    composed: true,
+                    detail: { replace: false },
+                })
+            );
         } catch {
             try { window.location.assign(path); } catch { }
         }
     }
 
+    // iOS continues BACKGROUND audio only for playback that began inside a
+    // user gesture: a resurrected session's element started autoplay-muted,
+    // and merely unmuting it later leaves the playback gesture-less — the
+    // moment the app minimizes, WebKit suspends it. Re-issue play()
+    // SYNCHRONOUSLY inside the dock tap so the element is re-marked as
+    // gesture-initiated and survives minimizing like an organically
+    // backgrounded stream.
+    gestureAnchorPlayback(key) {
+        const media = WebRTCsession.sessions.get(key)?.state?.backgroundCard?.media;
+        if (media && media.srcObject) {
+            try { media.play()?.catch?.(() => { }); } catch { }
+        }
+    }
+
     dockReturn(key) {
         WebRTCsession.enableUnmute();              // the tap IS the autoplay gesture
+        this.gestureAnchorPlayback(key);
         const session = WebRTCsession.sessions.get(key);
         session?.unpark?.();
         const e = this.entry(key);
-        if (e?.returnPath && e.returnPath !== this.currentPath()) {
+        if (!e?.returnPath) {
+            // Never a silent no-op: without a stored path the shortcut can't
+            // navigate — say so where a bug report can see it.
+            console.warn('webrtc-babycam: dock return has no stored path for', key);
+            return;
+        }
+        if (e.returnPath !== this.currentPath()) {
             this.navigate(e.returnPath);
         }
         // if already on the right view, the card's IntersectionObserver takes it from here
@@ -6140,6 +6181,7 @@ class BackgroundManager {
 
     dockResume(key) {
         WebRTCsession.enableUnmute();
+        this.gestureAnchorPlayback(key);
         const session = WebRTCsession.sessions.get(key);
         if (session) {
             session.unpark();
