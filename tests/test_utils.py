@@ -1,10 +1,47 @@
-"""Tests for Babycam frontend resource registration."""
+"""Tests for Babycam integration helpers."""
 
+import time
 from types import SimpleNamespace
 
+import jwt
 import pytest
+from homeassistant.components.http.auth import DATA_SIGN_SECRET, SIGN_QUERY_PARAM
 
-from custom_components.babycam.utils import async_init_resource
+from custom_components.babycam.utils import async_init_resource, validate_signed_request
+
+
+def test_validate_signed_request_accepts_matching_path() -> None:
+    """A current signature for the requested proxy path is accepted."""
+    secret = "test-secret"
+    signature = jwt.encode(
+        {"path": "/api/babycam/ws", "exp": time.time() + 60},
+        secret,
+        algorithm="HS256",
+    )
+    request = SimpleNamespace(
+        app={"hass": SimpleNamespace(data={DATA_SIGN_SECRET: secret})},
+        query={SIGN_QUERY_PARAM: signature},
+        path="/api/babycam/ws",
+    )
+
+    assert validate_signed_request(request) is True
+
+
+def test_validate_signed_request_rejects_other_path() -> None:
+    """A signature cannot be reused for a different endpoint."""
+    secret = "test-secret"
+    signature = jwt.encode(
+        {"path": "/api/other/ws", "exp": time.time() + 60},
+        secret,
+        algorithm="HS256",
+    )
+    request = SimpleNamespace(
+        app={"hass": SimpleNamespace(data={DATA_SIGN_SECRET: secret})},
+        query={SIGN_QUERY_PARAM: signature},
+        path="/api/babycam/ws",
+    )
+
+    assert validate_signed_request(request) is False
 
 
 class FakeResources:

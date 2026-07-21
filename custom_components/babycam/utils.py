@@ -1,17 +1,33 @@
-"""Minimal helpers for the babycam signaling proxy.
+"""Minimal helpers for the Babycam signaling proxy and frontend resource.
 
-Derived from the webrtc (AlexxIT) fork, stripped to what babycam actually
-uses: Lovelace registration of the bundled card. Domain and API paths are
-deliberately distinct from both the
+Derived from the webrtc (AlexxIT) fork, stripped to the signed-path validation
+and Lovelace registration Babycam uses. Domain and API paths are deliberately
+distinct from both the
 `webrtc` custom integration (/api/webrtc/*) and HA's built-in go2rtc
 integration, so all three can coexist.
 """
 
 import logging
 
+import jwt
+from aiohttp import web
+from homeassistant.components.http.auth import DATA_SIGN_SECRET, SIGN_QUERY_PARAM
+
 from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def validate_signed_request(request: web.Request) -> bool:
+    """Validate the path signature used by the proven legacy WebRTC proxy."""
+    try:
+        hass = request.app["hass"]
+        secret = hass.data.get(DATA_SIGN_SECRET)
+        signature = request.query.get(SIGN_QUERY_PARAM)
+        claims = jwt.decode(signature, secret, algorithms=["HS256"])
+        return claims["path"] == request.path
+    except Exception:  # noqa: BLE001 - invalid/missing signatures are rejected
+        return False
 
 
 async def async_init_resource(hass: HomeAssistant, url: str) -> bool:

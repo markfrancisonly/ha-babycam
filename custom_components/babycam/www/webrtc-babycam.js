@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.17';
+const CARD_VERSION = '2026.7.19';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -1605,15 +1605,17 @@ class WebRTCsession {
             }
         }
         else if (config.url_type === 'webrtc-babycam') {
-            // Babycam integration proxy. The upstream server is configured once in
-            // the integration, so cards only identify the go2rtc stream they need.
-            url = '/api/babycam/ws?' + new URLSearchParams({ entity: config.entity });
+            // Match the proven legacy WebRTC transport: sign the proxy route, then
+            // append the stream name and use the raw go2rtc signaling channel.
+            url = '/api/babycam/ws';
             const signature = await this.hass?.callWS?.({
                 type: 'auth/sign_path',
                 path: url
             });
             if (signature?.path) {
                 url = 'ws' + this.hass.hassUrl(signature.path).substring(4);
+                if (config.entity)
+                    url += '&entity=' + encodeURIComponent(config.entity);
                 signalingChannel = new Go2RtcSignalingChannel(url);
             }
         }
