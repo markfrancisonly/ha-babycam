@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.32';
+const CARD_VERSION = '2026.7.33';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -2517,6 +2517,24 @@ class WebRTCbabycam extends HTMLElement {
         `);
     }
 
+    // Native element fullscreen is a stage like the overlay: frame the media
+    // per `fit` (default both = contain), overriding tile presentation such as
+    // renderAspectRatio's cover-crop. Two separate prefix rules — a combined
+    // selector list would be invalidated by the unrecognized one.
+    renderFullscreenFit(fit) {
+        const card = this.shadowRoot.querySelector('.card');
+        if (!card) return;
+        const rules = WebRTCbabycam.fitRules(String(fit ?? 'both').toLowerCase());
+        card.insertAdjacentHTML('beforebegin', `
+        <style>
+            :host(:fullscreen) video, :host(:fullscreen) .image {${rules}}
+            :host(:fullscreen) ha-card, :host(:fullscreen) .media-container { overflow: hidden !important; }
+            :host(:-webkit-full-screen) video, :host(:-webkit-full-screen) .image {${rules}}
+            :host(:-webkit-full-screen) ha-card, :host(:-webkit-full-screen) .media-container { overflow: hidden !important; }
+        </style>
+        `);
+    }
+
     renderStyle(userCardStyle) {
         if (!userCardStyle) return;
         const style = document.createElement('style');
@@ -2593,6 +2611,35 @@ class WebRTCbabycam extends HTMLElement {
         paused:     { tap: 'fetch_image', double_tap: 'fullscreen', hold: 'fullscreen' },
         fullscreen: { tap: 'close', double_tap: 'close', hold: 'none', swipe: 'close' },
     };
+
+    // Fullscreen/overlay framing rules for a given fit mode. The media keeps
+    // its OWN aspect ratio in every mode; `fit` picks the axis it must fill,
+    // and overflow on the other axis clips symmetrically from the center.
+    // object-fit cannot express per-axis fill, so width/height set element
+    // geometry directly. Shared by the remote overlay stage and the
+    // :host(:fullscreen) style so both fullscreen paths frame identically.
+    static fitRules(fit) {
+        if (fit === 'width') {
+            return ' position: absolute !important;' +
+                ' left: 0 !important; right: 0 !important;' +
+                ' top: 50% !important; bottom: auto !important;' +
+                ' transform: translateY(-50%) !important;' +
+                ' width: 100% !important; height: auto !important;' +
+                ' margin: 0 !important;';
+        }
+        if (fit === 'height') {
+            return ' position: absolute !important;' +
+                ' top: 0 !important; bottom: 0 !important;' +
+                ' left: 50% !important; right: auto !important;' +
+                ' transform: translateX(-50%) !important;' +
+                ' height: 100% !important; width: auto !important;' +
+                ' margin: 0 !important;';
+        }
+        return ' position: absolute !important; inset: 0 !important;' +
+            ' width: 100% !important; height: 100% !important;' +
+            ' margin: 0 !important;' +
+            ' object-fit: contain !important; object-position: center !important;';
+    }
 
     get isInRemoteOverlay() {
         return !!this.closest?.('#babycam-remote-overlay');
@@ -3995,6 +4042,7 @@ class WebRTCbabycam extends HTMLElement {
             "style": null,
             "shortcuts": null,
             "aspect_ratio": null,
+            "fit": null,
             "url_type": "webrtc-babycam"
           };
 
@@ -4005,6 +4053,11 @@ class WebRTCbabycam extends HTMLElement {
             mergedConfig.image_interval = Math.max(33, mergedConfig.image_interval);
         }
 
+        if (mergedConfig.fit != null) {
+            // Fullscreen/overlay framing: both | width | height (see fitRules).
+            const fit = String(mergedConfig.fit).trim().toLowerCase();
+            mergedConfig.fit = ['both', 'width', 'height'].includes(fit) ? fit : null;
+        }
         if (mergedConfig.aspect_ratio != null) {
             // Accept "16/9", "16 / 9", "16:9", or a number; normalize to a CSS aspect-ratio value.
             mergedConfig.aspect_ratio = String(mergedConfig.aspect_ratio).trim().replace(':', '/');
@@ -4424,6 +4477,7 @@ class WebRTCbabycam extends HTMLElement {
             this.renderPTZ(hasMove, hasZoom, hasHome, hasVol, hasMic);
             this.renderShortcuts(shortcuts);
             this.renderAspectRatio(config.aspect_ratio);
+            this.renderFullscreenFit(config.fit);
             this.renderStyle(userCardStyle);
             this.renderInteractionEventListeners();
             this.rendered = true;
@@ -6973,30 +7027,7 @@ try {
         delete stageConfig.aspect_ratio;
         const fit = String(stageConfig.fit ?? 'both').toLowerCase();
         delete stageConfig.fit;
-        let stageRules;
-        if (fit === 'width') {
-            stageRules =
-                ' position: absolute !important;' +
-                ' left: 0 !important; right: 0 !important;' +
-                ' top: 50% !important; bottom: auto !important;' +
-                ' transform: translateY(-50%) !important;' +
-                ' width: 100% !important; height: auto !important;' +
-                ' margin: 0 !important;';
-        } else if (fit === 'height') {
-            stageRules =
-                ' position: absolute !important;' +
-                ' top: 0 !important; bottom: 0 !important;' +
-                ' left: 50% !important; right: auto !important;' +
-                ' transform: translateX(-50%) !important;' +
-                ' height: 100% !important; width: auto !important;' +
-                ' margin: 0 !important;';
-        } else {
-            stageRules =
-                ' position: absolute !important; inset: 0 !important;' +
-                ' width: 100% !important; height: 100% !important;' +
-                ' margin: 0 !important;' +
-                ' object-fit: contain !important; object-position: center !important;';
-        }
+        const stageRules = WebRTCbabycam.fitRules(fit);
         stageConfig.style = (stageConfig.style ? stageConfig.style + '\n' : '') +
             'video, .image {' + stageRules + ' }' +
             ' ha-card, .media-container { overflow: hidden !important; }';
