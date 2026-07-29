@@ -107,7 +107,7 @@ first log line shows the loaded version.
 | **ice_servers** | `array` | (optional) | Array of `RTCIceServer` objects, or `[]` | Replaces the built-in Google STUN default. Use `[]` on LAN-only setups (host candidates suffice; nothing contacts Google), or supply your own STUN/TURN servers for remote access. |
 | **image_url** | `string` | (optional)  | Any valid image URL | Custom URL for still snapshots when video is not playing. |
 | **image_entity** | `string` | (optional)  | Any HA camera entity id | Fetch still snapshots from this entity's `entity_picture` when `entity` has no HA entity behind it (e.g. `entity` is a go2rtc stream name like `camera.doorbell_sub`). Poster priority: `entity` → `image_entity` → `image_url`. |
-| **actions** | `object` | (optional) | Per-context gesture map | Configurable gestures: `actions.<context>.<gesture>` where context ∈ `image` \| `live` \| `fullscreen` and gesture ∈ `tap` \| `double_tap` \| `hold` (+ `swipe`, any direction, fullscreen only). Verbs: `fetch_image`, `go_live`, `go_image`, `toggle_live`, `fullscreen`, `toggle_fullscreen`, `close`, `toggle_mute`, `controls`, `more_info`, `none`, or a standard HA action object (`{action: perform-action \| navigate \| url \| more-info, ...}`). Defaults — image: tap `fetch_image`, double_tap `toggle_live`, hold `fullscreen`; live: tap `toggle_live`, double_tap `fullscreen`, hold `toggle_mute`; fullscreen: tap/double_tap/swipe `close`. Taps pay a ~280 ms disambiguation delay only in contexts where a double_tap is configured. |
+| **actions** | `object` | (optional) | Per-context gesture map | Configurable gestures: `actions.<context>.<gesture>` where context ∈ `image` \| `live` \| `fullscreen` and gesture ∈ `tap` \| `double_tap` \| `hold` (+ `swipe`, any direction, fullscreen only). Verbs: `fetch_image`, `go_live`, `go_image`, `toggle_live`, `fullscreen`, `toggle_fullscreen`, `fullscreen_live`, `close`, `toggle_mute`, `controls`, `more_info`, `none`, or a standard HA action object (`{action: perform-action \| navigate \| url \| more-info, ...}`). Defaults — image/paused: tap `fetch_image`, double_tap `fullscreen`, hold `fullscreen`; live: tap `toggle_live`, double_tap `fullscreen`, hold `toggle_mute`; fullscreen: tap/double_tap/swipe `close`. Taps pay a ~280 ms disambiguation delay only in contexts where a double_tap is configured. |
 | **image_interval** | `number` | `3000` (default) | Any numeric value in milliseconds | Interval (in ms) for fetching a new still image when video is not playing. |
 | **image_expiry** | `number` | `15000` (default) | Any numeric value in milliseconds | Time (in ms) before an image is considered expired or blurred. |
 | **ptz** | `object` | (optional)  | PTZ service call object | Specifies *Pan/Tilt/Zoom* service calls. Example: `{ service: 'camera.ptz', data_up: {...} }`. |
@@ -143,21 +143,37 @@ Gestures: `tap`, `double_tap`, `hold` everywhere, plus `swipe` (any direction)
 in fullscreen only (embedded swipes would fight dashboard scrolling).
 
 Verbs: `fetch_image`, `go_live`, `go_image`, `toggle_live`, `fullscreen`,
-`toggle_fullscreen`, `close`, `toggle_mute`, `controls`, `more_info`, `none`,
-or a standard HA action object (`{action: perform-action | navigate | url | more-info, ...}`).
+`toggle_fullscreen`, `fullscreen_live`, `close`, `toggle_mute`, `controls`,
+`more_info`, `none`, or a standard HA action object
+(`{action: perform-action | navigate | url | more-info, ...}`).
+
+`fullscreen` opens fullscreen in the card's *current* mode (a parked snapshot
+card fullscreens the refreshing still). `fullscreen_live` always shows live
+video in fullscreen — the per-gesture counterpart to `fullscreen: "video"` —
+and closing fullscreen reverses the go-live if this gesture is what started it.
 
 Defaults:
 
 ```yaml
 actions:
-  image:      { tap: fetch_image, double_tap: toggle_live, hold: fullscreen }
-  live:       { tap: toggle_live, double_tap: fullscreen,  hold: toggle_mute }
-  paused:     { tap: go_live, double_tap: fullscreen, hold: fullscreen }
+  image:      { tap: fetch_image, double_tap: fullscreen, hold: fullscreen }
+  live:       { tap: toggle_live, double_tap: fullscreen, hold: toggle_mute }
+  paused:     { tap: fetch_image, double_tap: fullscreen, hold: fullscreen }
   fullscreen: { tap: close, double_tap: close, hold: none, swipe: close }
 ```
 
+In words: on a snapshot (image-first parked, or natively snapshot mode) tap
+refreshes the still and double-tap fullscreens in current mode; on live video
+tap stops it **only on `start: image` cards** (live-first cards never stop)
+and double-tap fullscreens; inside fullscreen any tap or swipe closes. Starting
+video is always an explicit config choice (`toggle_live`, `go_live`,
+`fullscreen_live`), never a default single tap.
+
 Notes: taps pay a ~280 ms disambiguation delay only in contexts where a
-`double_tap` is configured; gestures stand down while native video controls
+`double_tap` is configured; single-tap and hold verbs therefore dispatch from a
+timer, outside the browser's user-activation window — if the engine refuses
+`requestFullscreen()` there (WebKit does), the card falls back to its own
+full-viewport overlay; gestures stand down while native video controls
 are visible; `toggle_live` is session-scoped (cards sharing a stream pause and
 resume together) and keeps the snapshot loop polling while paused.
 
