@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.31';
+const CARD_VERSION = '2026.7.32';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -6961,17 +6961,45 @@ try {
         card.style.cssText = 'width:100%;height:100%;touch-action:none;';
         // The overlay is a STAGE, not a tile: drop the per-card aspect_ratio
         // (which locks a cover-cropped, top-anchored box sized for the grid)
-        // and contain-fit the media at its OWN aspect ratio, centered — the
-        // native player's presentation with the card's chrome. Rides the user
-        // style: mechanism, which injects after the card's own sizing rules.
+        // and frame the media at its OWN aspect ratio, centered. `fit` picks
+        // the axis the media must fill (overflow on the other axis is clipped
+        // symmetrically from the center): 'both' (default) letterboxes like
+        // the native player; 'width' fills the width and crops top/bottom;
+        // 'height' fills the height and crops the sides. object-fit cannot
+        // express per-axis fill, so width/height set element geometry
+        // directly. Rides the user style: mechanism, which injects after the
+        // card's own sizing rules.
         const stageConfig = { ...config };
         delete stageConfig.aspect_ratio;
+        const fit = String(stageConfig.fit ?? 'both').toLowerCase();
+        delete stageConfig.fit;
+        let stageRules;
+        if (fit === 'width') {
+            stageRules =
+                ' position: absolute !important;' +
+                ' left: 0 !important; right: 0 !important;' +
+                ' top: 50% !important; bottom: auto !important;' +
+                ' transform: translateY(-50%) !important;' +
+                ' width: 100% !important; height: auto !important;' +
+                ' margin: 0 !important;';
+        } else if (fit === 'height') {
+            stageRules =
+                ' position: absolute !important;' +
+                ' top: 0 !important; bottom: 0 !important;' +
+                ' left: 50% !important; right: auto !important;' +
+                ' transform: translateX(-50%) !important;' +
+                ' height: 100% !important; width: auto !important;' +
+                ' margin: 0 !important;';
+        } else {
+            stageRules =
+                ' position: absolute !important; inset: 0 !important;' +
+                ' width: 100% !important; height: 100% !important;' +
+                ' margin: 0 !important;' +
+                ' object-fit: contain !important; object-position: center !important;';
+        }
         stageConfig.style = (stageConfig.style ? stageConfig.style + '\n' : '') +
-            'video, .image {' +
-            ' position: absolute !important; inset: 0 !important;' +
-            ' width: 100% !important; height: 100% !important;' +
-            ' margin: 0 !important;' +
-            ' object-fit: contain !important; object-position: center !important; }';
+            'video, .image {' + stageRules + ' }' +
+            ' ha-card, .media-container { overflow: hidden !important; }';
         try {
             card.setConfig(stageConfig);
         } catch (err) {

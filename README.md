@@ -193,7 +193,11 @@ with that integration and HA's built-in go2rtc):
 - **`babycam.open` / `babycam.close` services** — open/close a **fullscreen
   overlay on every connected browser** (true 100% viewport, above all app
   chrome). All service fields are forwarded verbatim as the card config —
-  `entity` (stream), `image_entity`, `actions`, etc. Non-admin browsers receive
+  `entity` (stream), `image_entity`, `actions`, etc. The overlay ignores
+  `aspect_ratio` (tile presentation) and frames media at its own ratio,
+  centered; `fit: both | width | height` (default `both`) picks the axis the
+  media must fill — `both` letterboxes, `width`/`height` fill that axis and
+  crop the other symmetrically from the center. Non-admin browsers receive
   events via the integration's
   `babycam/subscribe` websocket command (arbitrary bus-event subscriptions
   are admin-only in HA).
