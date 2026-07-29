@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.21';
+const CARD_VERSION = '2026.7.28';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -1618,6 +1618,21 @@ class WebRTCsession {
                     url += '&entity=' + encodeURIComponent(config.entity);
                 signalingChannel = new Go2RtcSignalingChannel(url);
             }
+            // Integration-level STUN/TURN (config flow): fills the same
+            // advertised-configuration slot the hass channel uses, below an
+            // explicit per-card ice_servers. Cached per session; a failed
+            // fetch stays undefined so the next call retries.
+            if (this.integrationClientConfiguration === undefined) {
+                try {
+                    const cfg = await this.hass?.callWS?.({ type: 'babycam/config' });
+                    this.integrationClientConfiguration =
+                        Array.isArray(cfg?.ice_servers) && cfg.ice_servers.length
+                            ? { iceServers: cfg.ice_servers }
+                            : null;
+                } catch (err) {
+                    this.trace(`babycam/config fetch failed: ${err.message}`);
+                }
+            }
         }
         else if (config.url_type === 'webrtc-camera') {
             const data = await this.hass?.callWS?.({
@@ -1736,7 +1751,9 @@ class WebRTCsession {
             if (signalingChannel.isOpen) {
                 // RTCConfiguration the server advertised during open (hass channel only);
                 // createPeer runs after this and prefers it over the Google-STUN default.
-                call.clientConfiguration = signalingChannel.clientConfiguration ?? null;
+                call.clientConfiguration = signalingChannel.clientConfiguration
+                    ?? this.integrationClientConfiguration
+                    ?? null;
                 this.trace(`Opened '${url}'`);
             }
             else {
@@ -3548,8 +3565,14 @@ class WebRTCbabycam extends HTMLElement {
                 return;  
 
             case 'error':
-                icon = "mdi:alert-circle";
-                show = true;
+                // An 'error' here is one failed attempt in the card's unbounded
+                // reconnect loop, not a settled failure. Showing mdi:alert-circle
+                // immediately (no grace) while 'connecting' hides its spinner
+                // until waitedTooLong made the icon STROBE error<->hidden (and
+                // swap glyph) on every retry. Fold error into the connecting
+                // grace path: a steady loading spinner after the shared clock,
+                // with the cause kept in the hover tooltip. Recovery hides it; a
+                // persistent failure shows a steady spinner, never a flash.
                 title = error;
                 // fall-through
 
@@ -3563,9 +3586,10 @@ class WebRTCbabycam extends HTMLElement {
                 if (!this.playingWaitStartDate) {
                     this.playingWaitStartDate = Date.now();
                 }
-                // Don't clobber the 'error' fall-through icon (mdi:alert-circle) with the
-                // loading/volume-mute glyph; the error case relies on reaching setStateIcon.
-                if (status !== 'error') {
+                // error/disconnected/connecting all share this "still trying"
+                // glyph now (steady loading spinner), so the icon never swaps
+                // mid-retry; the error text rides the tooltip.
+                if (icon === undefined) {
                     icon = audioOnly ? "mdi:volume-mute" : "mdi:loading";
                 }
                 show = show || (Date.now() >= this.playingWaitStartDate + waitedTooLong);
@@ -4729,6 +4753,21 @@ class WebRTCbabycam extends HTMLElement {
         switch (ev.type) {
             case 'emptied':
                 this.stopVideoFrameMonitor();
+                // 'emptied' is NOT always teardown: some engines (notably the
+                // Android WebView) re-run resource selection when a second track
+                // lands on the already-playing srcObject — firing emptied ->
+                // loadedmetadata -> playing on the SAME live stream. Blanking
+                // 'playing' there drops the revealed video to visibility:hidden
+                // for the reload gap, flashing the snapshot beneath it (the
+                // video<->image shudder). Only tear down the visuals on a REAL
+                // emptied — srcObject gone, or no live tracks left. A genuine
+                // stream end already routes through unloadRemoteStream() (which
+                // nulls srcObject before this fires), and a silent freeze ages
+                // out via the stale reconciler; so keeping the last frame shown
+                // across a spurious reload costs nothing and removes the flash.
+                if (media.srcObject && media.srcObject.getTracks().length) {
+                    break;
+                }
                 this.cancelPendingReveal();
                 this.setMediaStale(false);
                 this.live(false);

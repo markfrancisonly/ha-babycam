@@ -2,13 +2,13 @@
   "config": {
     "step": {
       "user": {
-        "title": "Configure Babycam",
-        "description": "Connect Babycam to a go2rtc server. Enter the websocket base address without /api/ws.",
+        "title": "Connect Babycam to go2rtc",
+        "description": "Babycam relays each card's WebRTC signaling to a go2rtc server — typically the one built into Frigate or Home Assistant's go2rtc add-on. Enter that server's WebSocket base address.",
         "data": {
-          "url": "go2rtc websocket address"
+          "url": "go2rtc WebSocket base address"
         },
         "data_description": {
-          "url": "For example, ws://go2rtc-host:1984 or wss://go2rtc.example.com"
+          "url": "ws:// for a server on your network (ws://frigate:1984), or wss:// including any path prefix when go2rtc sits behind a reverse proxy (wss://cctv.example.com/live/webrtc)."
         }
       }
     },
@@ -24,15 +24,20 @@
       "init": {
         "title": "Babycam Options",
         "data": {
-          "url": "go2rtc websocket address"
+          "url": "go2rtc WebSocket base address",
+          "ice_servers": "Custom STUN/TURN servers (JSON)",
+          "dev_mode": "Developer mode (serve card live from disk)"
         },
         "data_description": {
-          "url": "Base address only; Babycam adds /api/ws automatically."
+          "url": "The go2rtc server Babycam relays WebRTC signaling to (e.g. ws://frigate:1984, or wss://cctv.example.com/live/webrtc behind a reverse proxy).",
+          "ice_servers": "JSON list of RTCIceServer entries used by every card unless the card sets its own ice_servers. Add a TURN server on TCP port 443 (urls scheme turns:, plus username and credential) to keep remote streams working on restrictive networks. Clearing the field restores the default STUN entry shown here.",
+          "dev_mode": "Card file edits appear on a browser reload without restarting Home Assistant. Leave off in production so the card and backend only change together at restart."
         }
       }
     },
     "error": {
-      "invalid_url": "Invalid URL"
+      "invalid_url": "Invalid URL",
+      "invalid_ice_servers": "Invalid STUN/TURN configuration"
     }
   }
 }

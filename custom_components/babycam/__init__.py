@@ -18,12 +18,16 @@ from homeassistant.core import Event, HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.loader import async_get_integration
 from homeassistant.setup import async_when_setup
 
 from . import utils
 from .const import (
     CARD_FILENAME,
     CARD_URL,
+    CONF_DEV_MODE,
+    CONF_ICE_SERVERS,
+    DEFAULT_ICE_SERVERS,
     DOMAIN,
     EVENT_CLOSE,
     EVENT_OPEN,
@@ -84,33 +88,90 @@ async def ws_subscribe(
     connection.send_result(msg["id"])
 
 
-class CardView(HomeAssistantView):
-    """Serve the bundled card with always-revalidate caching.
+@websocket_api.websocket_command({vol.Required("type"): "babycam/config"})
+@callback
+def ws_config(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Return integration-level client configuration for the card.
 
-    ``no-cache`` plus FileResponse's validators (ETag / Last-Modified) mean a
-    plain dashboard reload picks up a replaced file — no Home Assistant
-    restart, no version query — while unchanged loads stay cheap 304s.
+    Cards slot these ICE servers into the advertised-configuration slot,
+    below an explicit per-card ``ice_servers``.
+    """
+    data = hass.data.get(DOMAIN) or {}
+    connection.send_result(
+        msg["id"], {"ice_servers": data.get(CONF_ICE_SERVERS) or None}
+    )
+
+
+class CardView(HomeAssistantView):
+    """Serve the card bytes captured at backend startup.
+
+    The snapshot is the backend/frontend contract: browsers get exactly the
+    card that shipped with the RUNNING backend. An update (HACS, manual copy)
+    only overwrites the file on disk — the served bytes and ETag hold until
+    Home Assistant restarts, when backend code and card flip together, so a
+    new card never talks to an old backend or vice versa. ``no-cache`` keeps
+    every dashboard reload revalidating: cheap 304s between restarts, one
+    full fetch after.
+
+    The ``dev_mode`` option is the development hatch: it serves the file live
+    from disk on the same URL, so copying a new card in shows up on a plain
+    browser reload — no restart, no contract. Production leaves it off.
     """
 
     url = CARD_URL
     name = "babycam:card"
     requires_auth = False  # module scripts are fetched without auth headers
 
-    async def get(self, _request: web.Request) -> web.FileResponse:
-        """Return the card source."""
-        return web.FileResponse(CARD_PATH, headers={"Cache-Control": "no-cache"})
+    def __init__(self, card: bytes, etag: str) -> None:
+        """Hold the card bytes and contract ETag for the backend's lifetime."""
+        self.card = card
+        self.etag = etag
 
-    async def head(self, request: web.Request) -> web.FileResponse:
-        """Answer HEAD probes (FileResponse sends headers only for HEAD)."""
+    @staticmethod
+    def _respond(request: web.Request, card: bytes, etag: str) -> web.Response:
+        headers = {"Cache-Control": "no-cache", "ETag": f'"{etag}"'}
+        # aiohttp parses If-None-Match into ETag objects: lists and W/ weak
+        # validators (a compressing proxy may weaken ours) match by value.
+        if request.if_none_match and any(
+            tag.value in ("*", etag) for tag in request.if_none_match
+        ):
+            return web.Response(status=304, headers=headers)
+        return web.Response(
+            body=card,
+            content_type="text/javascript",
+            charset="utf-8",
+            headers=headers,
+        )
+
+    async def get(self, request: web.Request) -> web.Response:
+        """Return the card source, or 304 when the browser's copy matches."""
+        hass = request.app[KEY_HASS]
+        data = hass.data.get(DOMAIN)
+        if data and data.get(CONF_DEV_MODE):
+            card = await hass.async_add_executor_job(CARD_PATH.read_bytes)
+            return self._respond(request, card, utils.card_etag("dev", card))
+        return self._respond(request, self.card, self.etag)
+
+    async def head(self, request: web.Request) -> web.Response:
+        """Answer HEAD probes (aiohttp omits the body automatically)."""
         return await self.get(request)
 
 
 async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     """Register integration-wide HTTP, websocket, and frontend resources."""
+    integration = await async_get_integration(hass, DOMAIN)
+    card = await hass.async_add_executor_job(CARD_PATH.read_bytes)
+    hass.http.register_view(
+        CardView(card, utils.card_etag(integration.version, card))
+    )
     hass.http.register_view(WebSocketView)
     hass.http.register_view(StreamView)
-    hass.http.register_view(CardView)
     websocket_api.async_register_command(hass, ws_subscribe)
+    websocket_api.async_register_command(hass, ws_config)
 
     async def register_card(hass: HomeAssistant, _component: str) -> None:
         await utils.async_init_resource(hass, CARD_URL)
@@ -124,7 +185,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data[DOMAIN] = {
         "entry_id": entry.entry_id,
         CONF_URL: entry.data[CONF_URL],
+        CONF_ICE_SERVERS: entry.data.get(CONF_ICE_SERVERS) or DEFAULT_ICE_SERVERS,
+        CONF_DEV_MODE: entry.options.get(CONF_DEV_MODE, False),
     }
+    if hass.data[DOMAIN][CONF_DEV_MODE]:
+        _LOGGER.warning(
+            "Babycam dev mode: serving the card live from %s; the "
+            "backend/frontend startup contract is suspended",
+            CARD_PATH,
+        )
 
     async def handle_open(call: ServiceCall) -> None:
         hass.bus.async_fire(EVENT_OPEN, dict(call.data))
@@ -164,6 +233,8 @@ def signaling_url(hass: HomeAssistant, entity: str) -> str:
 
     query = urlencode({"src": entity})
     return f"{data[CONF_URL]}/api/ws?{query}"
+
+
 
 
 class WebSocketView(HomeAssistantView):

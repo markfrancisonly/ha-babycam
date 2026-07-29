@@ -7,6 +7,7 @@ distinct from both the
 integration, so all three can coexist.
 """
 
+import hashlib
 import logging
 
 import jwt
@@ -30,14 +31,28 @@ def validate_signed_request(request: web.Request) -> bool:
         return False
 
 
+def card_etag(version: str | None, card: bytes) -> str:
+    """Version the backend/frontend contract as an HTTP ETag.
+
+    Combines the running backend's release with a digest of the card bytes it
+    captured at startup, so the validator moves exactly when the contract
+    does — at a restart that changed either side — and never when a pending
+    update merely lands on disk. Returned unquoted; the view quotes it when
+    emitting the header and compares against aiohttp's parsed validators.
+    """
+    digest = hashlib.sha256(card).hexdigest()[:12]
+    return f"{version or '0'}-{digest}"
+
+
 async def async_init_resource(hass: HomeAssistant, url: str) -> bool:
     """Ensure a module entry for ``url`` in the Lovelace resource registry.
 
-    The card is served with ``Cache-Control: no-cache`` and validators, so
-    the URL needs no version query: browsers revalidate on every dashboard
-    load and a plain reload picks up replaced code (304 when unchanged).
-    Storage-mode dashboards only: in YAML mode the resource list is
-    user-managed, so log the line to add instead.
+    The card is served with ``Cache-Control: no-cache`` and a contract ETag
+    (see ``card_etag``), so the URL needs no version query: browsers
+    revalidate on every dashboard load (cheap 304s) and fetch fresh code
+    after the restart that activated a new backend. Storage-mode dashboards
+    only: in YAML mode the resource list is user-managed, so log the line to
+    add instead.
     """
     lovelace = hass.data.get("lovelace")
     resources = getattr(lovelace, "resources", None)
