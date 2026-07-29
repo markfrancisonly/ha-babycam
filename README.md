@@ -173,9 +173,13 @@ Notes: taps pay a ~280 ms disambiguation delay only in contexts where a
 `double_tap` is configured; single-tap and hold verbs therefore dispatch from a
 timer, outside the browser's user-activation window — if the engine refuses
 `requestFullscreen()` there (WebKit does), the card falls back to its own
-full-viewport overlay; gestures stand down while native video controls
-are visible; `toggle_live` is session-scoped (cards sharing a stream pause and
-resume together) and keeps the snapshot loop polling while paused.
+full-viewport overlay; on engines with no element-fullscreen API at all
+(iPhone Safari, iOS companion app) every fullscreen verb uses the card
+overlay — never the native video player, which has no Live indicator or card
+controls and pauses the element on close; gestures stand down while native
+video controls are visible; `toggle_live` is session-scoped (cards sharing a
+stream pause and resume together) and keeps the snapshot loop polling while
+paused.
 
 ### Babycam custom integration (fullscreen overlay + go2rtc proxy)
 

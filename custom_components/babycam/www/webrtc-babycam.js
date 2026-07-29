@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.29';
+const CARD_VERSION = '2026.7.30';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -2688,26 +2688,14 @@ class WebRTCbabycam extends HTMLElement {
             return;
         }
 
-        // iOS WKWebView: no element fullscreen API. Native video fullscreen
-        // (webkitEnterFullscreen) is only valid once loadedmetadata has
-        // fired — and a cold-starting WebRTC card cannot reach that without
-        // losing the tap's transient activation, so one tap can never do
-        // both. Media-ready videos get the native player; everything else
-        // (image-first cards, still connecting, video off) opens the card's
-        // own full-viewport overlay, which mounts synchronously inside the
-        // gesture and needs no media readiness.
-        const media = this.media;
-        if (this.config.video !== false
-            && typeof media?.webkitEnterFullscreen === 'function'
-            && media.readyState >= 1 && media.webkitSupportsFullscreen) {
-            try {
-                media.webkitEnterFullscreen();
-                return;
-            } catch (err) {
-                this.trace(`fullscreen: ${err.message}; falling back to overlay`);
-            }
-        }
-
+        // iOS (no element fullscreen API): ALWAYS the card's own
+        // full-viewport overlay, never webkitEnterFullscreen. The native
+        // player owns the screen (no Live indicator, no card controls or
+        // gestures) and pauses the element on close, flashing the paused
+        // state until auto-resume reverses it. Tradeoff accepted 2026-07-29:
+        // the native player's AirPlay/PiP affordances are given up for a
+        // consistent card experience; the overlay also mounts synchronously
+        // inside the gesture and needs no media readiness.
         const session = this.session;
         const resumed = this.config.fullscreen === 'video' && session?.viewerPaused === true;
         if (resumed) {
