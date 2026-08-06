@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.7.33';
+const CARD_VERSION = '2026.8.1';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -2254,11 +2254,13 @@ class WebRTCbabycam extends HTMLElement {
             <div class="media-container">
                 <img class="image" alt>
                 <ha-icon class="state"></ha-icon>
+                <!-- log lives INSIDE the gesture surface: interactive while
+                     visible, its events bubble to the gesture engine -->
+                <div class="log hidden"></div>
             </div>
             <div class="box">
                 <div class="header"></div>
             </div>
-            <div class="log hidden"></div>
         </ha-card>
         `;
 
@@ -2830,10 +2832,25 @@ class WebRTCbabycam extends HTMLElement {
         let holdFired = false;
         let tapTimer = null;
         let downPoint = null;
+        let lastPoint = null;
 
         const dispatch = (gesture) => {
             const verb = this.gestureFor(gesture);
             if (verb) this.executeGestureAction(verb);
+        };
+
+        // A gesture that swaps the DOM under the finger (fullscreen or overlay
+        // open/close) is chased by a browser-synthesized click that lands on
+        // whatever now occupies that point — swallow it before it taps a
+        // random dashboard element.
+        const swallowGhostClick = (ms = 250) => {
+            const until = Date.now() + ms;
+            const swallow = (ev) => {
+                window.removeEventListener('click', swallow, true);
+                if (Date.now() <= until) { ev.stopPropagation(); ev.preventDefault(); }
+            };
+            window.addEventListener('click', swallow, true);
+            setTimeout(() => window.removeEventListener('click', swallow, true), ms + 50);
         };
 
         // Taps are synthesized from pointer events, NOT the browser 'click':
@@ -2848,22 +2865,31 @@ class WebRTCbabycam extends HTMLElement {
         // becomes no gesture.
         container.addEventListener('pointerdown', (ev) => {
             if (!ev.isPrimary || ignores(ev)) return;
+            ev.stopPropagation();   // the gesture surface owns this press
             holdFired = false;
             clearTimeout(holdTimer);
             holdTimer = setTimeout(() => { holdFired = true; dispatch('hold'); }, 600);
             downPoint = { x: ev.clientX, y: ev.clientY, t: Date.now() };
+            lastPoint = downPoint;
         });
 
         const cancelHold = () => { clearTimeout(holdTimer); holdTimer = null; };
-        const cancelGesture = () => { cancelHold(); downPoint = null; };
+        const cancelGesture = () => { cancelHold(); downPoint = null; lastPoint = null; };
+
+        container.addEventListener('pointermove', (ev) => {
+            if (!ev.isPrimary || !downPoint) return;
+            lastPoint = { x: ev.clientX, y: ev.clientY };
+        });
 
         container.addEventListener('pointerup', (ev) => {
             cancelHold();
             if (!ev.isPrimary || !downPoint) return;
             const down = downPoint;
             downPoint = null;
+            lastPoint = null;
             if (ignores(ev)) return;
-            if (holdFired) { holdFired = false; return; }
+            ev.stopPropagation();
+            if (holdFired) { holdFired = false; swallowGhostClick(); return; }
             if (this.media?.controls) return;   // native controls own the surface
 
             const dx = ev.clientX - down.x;
@@ -2872,36 +2898,67 @@ class WebRTCbabycam extends HTMLElement {
             const travel = Math.hypot(dx, dy);
 
             // swipe (ANY direction): fullscreen context only (dashboards need
-            // scrolling). NOTE: needs touch-action:none on the surface or the
-            // browser claims the drag for scrolling and pointerup never fires
-            // with the delta — the remote overlay sets that inline.
-            if (this.gestureContext() === 'fullscreen' && dt < 600 && travel > 60) {
+            // scrolling). touch-action:none on the fullscreen surface keeps
+            // the engine from claiming the drag; when something steals it
+            // anyway (host-app gestures like pull-to-refresh), the
+            // pointercancel path below still delivers the swipe.
+            if (this.gestureContext() === 'fullscreen' && dt < 1200 && travel > 60) {
                 dispatch('swipe');
+                swallowGhostClick();
                 return;
             }
 
             if (travel > 12 || dt >= 600) return;   // drag or slow press, not a tap
 
+            // Refractory: right after an instant dispatch, the second tap of
+            // double-tap muscle memory must not fire the verb again in the
+            // NEW context (open -> instant close, or close -> reopen through
+            // the card now under the finger). Static: the second tap can land
+            // on a DIFFERENT card instance after an overlay close.
+            if (Date.now() < (WebRTCbabycam._tapRefractoryUntil ?? 0)) return;
+
+            const tap = this.gestureFor('tap');
             const dbl = this.gestureFor('double_tap');
-            if (dbl && dbl !== 'none') {
-                // double-tap configured: tap pays the disambiguation delay
+            if (dbl && dbl !== 'none' && dbl !== tap) {
+                // distinct double-tap configured: tap pays the disambiguation delay
                 if (tapTimer) {
                     clearTimeout(tapTimer); tapTimer = null;
                     dispatch('double_tap');
+                    swallowGhostClick();
                 }
                 else {
                     tapTimer = setTimeout(() => { tapTimer = null; dispatch('tap'); }, 280);
                 }
             }
             else {
+                // no double-tap, or double-tap == tap: nothing to disambiguate,
+                // dispatch immediately (fullscreen open/close feels instant)
+                WebRTCbabycam._tapRefractoryUntil = Date.now() + 350;
                 dispatch('tap');
+                swallowGhostClick();
             }
         });
-        container.addEventListener('pointercancel', cancelGesture);
+        container.addEventListener('pointercancel', () => {
+            // the engine or host app claimed the drag mid-gesture; in
+            // fullscreen nothing legitimately scrolls, so a cancelled drag
+            // with real travel is still the user's swipe
+            if (downPoint && lastPoint && this.gestureContext() === 'fullscreen') {
+                const travel = Math.hypot(lastPoint.x - downPoint.x, lastPoint.y - downPoint.y);
+                if (travel > 60) dispatch('swipe');
+            }
+            cancelGesture();
+        });
         container.addEventListener('pointerleave', cancelHold);
 
         // mobile long-press must not open the browser context menu / image save
         container.addEventListener('contextmenu', (ev) => { ev.preventDefault(); });
+
+        // Gestures are pointer-driven; the synthesized click that follows has
+        // no purpose inside the card and must not surface as a tap on
+        // ancestors (hui wrappers, cards behind an overlay).
+        container.addEventListener('click', (ev) => {
+            if (!ignores(ev)) ev.stopPropagation();
+        });
     }
 
     renderInteractionEventListeners() {
@@ -4348,7 +4405,9 @@ class WebRTCbabycam extends HTMLElement {
     };
 
     fullscreenChanged() {
-        if (document.fullscreenElement) return;
+        // prefix-aware: bare fullscreenElement is undefined on webkit-only
+        // engines, which would run the exit path while ENTERING fullscreen
+        if (document.fullscreenElement ?? document.webkitFullscreenElement) return;
         // Restore the snapshot when leaving fullscreen ONLY if entering it is
         // what started the video (fullscreen: 'video' on an image-first
         // card). Runs here so Esc and system exits count, not just gestures.
