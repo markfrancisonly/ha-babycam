@@ -5,19 +5,27 @@ open:
     All fields are forwarded verbatim to the card as its configuration.
   fields:
     entity:
-      name: Entity / stream
-      description: go2rtc stream name (or HA camera entity) to stream.
+      name: Entity
+      description: HA camera entity — identity, snapshots, and (unless stream is set) what plays.
       required: true
-      example: camera.doorbell_sub
+      example: camera.doorbell
+      selector:
+        text:
+    stream:
+      name: Stream
+      description: go2rtc stream to play instead of the entity (e.g. a lighter transcode).
+      example: camera.doorbell_hd
       selector:
         text:
     image_entity:
       name: Image entity
-      description: HA camera entity used for still snapshots (poster) while connecting.
+      description: Entity supplying still snapshots (poster) instead of the camera entity.
       example: camera.doorbell
       selector:
         entity:
-          domain: camera
+          domain:
+            - camera
+            - image
     url:
       name: URL
       description: >

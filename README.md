@@ -82,7 +82,8 @@ first log line shows the loaded version.
 
 | **Name** | **Type** | **Default** | **Supported Options** | **Description** |
 |----------|----------|-------------|----------------------|----------------|
-| **entity** | `string` | **Required** | go2rtc stream name or camera entity ID | The stream passed to go2rtc. If it is also a Home Assistant entity, its `entity_picture` is used as the snapshot fallback. |
+| **entity** | `string` | **Required** | Camera entity ID (or go2rtc stream name) | The camera's identity: name, snapshots (`entity_picture`), more-info — and, unless `stream` is set, also the stream passed to go2rtc. |
+| **stream** | `string` | (optional) | Any go2rtc stream name | Play this go2rtc stream instead of `entity` — e.g. a lower-resolution transcode for tablets — while `entity` keeps supplying the identity and snapshots. Ignored by `url_type: hass` (the native path streams the entity itself). |
 | **url** | `string` | (optional) | Any valid HTTP(s) or WebSocket URL | Not used by the default integration proxy. Required only for direct `go2rtc`, `webrtc-camera`, `whep`, or `rtsptoweb` transports. |
 | **url_type** | `string` | `"webrtc-babycam"` | `"webrtc-babycam"`, `"hass"`, `"go2rtc"`, `"webrtc-camera"`, `"whep"`, `"rtsptoweb"` | Determines which signaling approach/class is used. |
 | **video** | `boolean` | `true` | `true`, `false` | Enable (receive) video track. If `false`, video is disabled (audio-only or still images). |
@@ -107,7 +108,7 @@ first log line shows the loaded version.
 | **fps** | `number` | (optional) | Any numeric FPS value | A numeric hint for frames per second (FPS) used to estimate "render quality" in stats. If `null`, auto-detects FPS. |
 | **ice_servers** | `array` | (optional) | Array of `RTCIceServer` objects, or `[]` | Replaces the built-in Google STUN default. Use `[]` on LAN-only setups (host candidates suffice; nothing contacts Google), or supply your own STUN/TURN servers for remote access. |
 | **image_url** | `string` | (optional)  | Any valid image URL | Custom URL for still snapshots when video is not playing. |
-| **image_entity** | `string` | (optional)  | Any HA camera entity id | Fetch still snapshots from this entity's `entity_picture` when `entity` has no HA entity behind it (e.g. `entity` is a go2rtc stream name like `camera.doorbell_sub`). Poster priority: `entity` → `image_entity` → `image_url`. |
+| **image_entity** | `string` | (optional)  | Any entity with an `entity_picture` (camera, image, ...) | Fetch still snapshots from this entity instead. Poster priority: `entity` → `image_entity` → `image_url`. Legacy note: `entity: <go2rtc stream> + image_entity: <camera>` predates `stream` — prefer `entity: <camera> + stream: <go2rtc stream>`. |
 | **actions** | `object` | (optional) | Per-context gesture map | Configurable gestures: `actions.<context>.<gesture>` where context ∈ `image` \| `live` \| `fullscreen` and gesture ∈ `tap` \| `double_tap` \| `hold` (+ `swipe`, any direction, fullscreen only). Verbs: `fetch_image`, `go_live`, `go_image`, `toggle_live`, `fullscreen`, `toggle_fullscreen`, `fullscreen_live`, `close`, `toggle_mute`, `controls`, `more_info`, `none`, or a standard HA action object (`{action: perform-action \| navigate \| url \| more-info, ...}`). Defaults — image/paused: tap `fetch_image`, double_tap `fullscreen`, hold `fullscreen`; live: tap `toggle_live`, double_tap `fullscreen`, hold `toggle_mute`; fullscreen: tap/double_tap/swipe `close`. Taps pay a ~280 ms disambiguation delay only in contexts where a double_tap is configured. |
 | **image_interval** | `number` | `3000` (default) | Any numeric value in milliseconds | Interval (in ms) for fetching a new still image when video is not playing. |
 | **image_expiry** | `number` | `15000` (default) | Any numeric value in milliseconds | Time (in ms) before an image is considered expired or blurred. |
@@ -194,7 +195,7 @@ with that integration and HA's built-in go2rtc):
 - **`babycam.open` / `babycam.close` services** — open/close a **fullscreen
   overlay on every connected browser** (true 100% viewport, above all app
   chrome). All service fields are forwarded verbatim as the card config —
-  `entity` (stream), `image_entity`, `actions`, etc. The overlay ignores
+  `entity`, `stream`, `actions`, etc. The overlay ignores
   `aspect_ratio` (tile presentation) and frames media at its own ratio,
   centered; `fit: both | width | height` (default `both`) picks the axis the
   media must fill — `both` letterboxes, `width`/`height` fill that axis and
@@ -207,8 +208,8 @@ with that integration and HA's built-in go2rtc):
 # e.g. a doorbell automation
 - action: babycam.open
   data:
-    entity: camera.doorbell_sub
-    image_entity: camera.doorbell     # instant poster
+    entity: camera.doorbell           # identity + instant poster
+    stream: camera.doorbell_sub       # lighter stream to actually play
 - delay: 15
 - action: babycam.close
 ```

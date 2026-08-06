@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.3';
+const CARD_VERSION = '2026.8.4';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -183,6 +183,9 @@ class WebRTCsession {
         // keep their historical session keys (and stored background pins).
         if (config.image_entity) {
             variantParts.push(config.image_entity);
+        }
+        if (config.stream) {
+            variantParts.push(config.stream);
         }
         const variant = variantParts.join('|');
         let hash = 5381;
@@ -1585,10 +1588,16 @@ class WebRTCsession {
         this.refreshHass();
         this.trace(`Opening ${config.url_type} signaling channel`);
 
+        // `stream` overrides which go2rtc stream plays; `entity` stays the HA
+        // camera identity (name, snapshots, more-info).
+        const src = config.stream ?? config.entity;
+
         if (config.url_type === 'hass') {
             // Home Assistant's native camera WebRTC API (built-in go2rtc integration or
             // any registered provider). `url` is intentionally ignored: signaling rides
             // the card's existing authenticated HA connection.
+            if (config.stream)
+                this.trace(`stream '${config.stream}' ignored: url_type hass streams the entity itself`);
             if (config.entity && this.hass?.connection) {
                 url = `camera/webrtc:${config.entity}`;
                 signalingChannel = new HomeAssistantSignalingChannel(this.hass, config.entity);
@@ -1600,7 +1609,7 @@ class WebRTCsession {
                 if (params.has('src'))
                     url = `ws${config.url.substr(4).replace(/\/$/, '')}/api/ws?src=${params.get('src')}`;
                 else
-                    url = `ws${config.url.substr(4).replace(/\/$/, '')}/api/ws?src=${config.entity}`;
+                    url = `ws${config.url.substr(4).replace(/\/$/, '')}/api/ws?src=${src}`;
                 signalingChannel = new Go2RtcSignalingChannel(url);
             }
         }
@@ -1614,8 +1623,8 @@ class WebRTCsession {
             });
             if (signature?.path) {
                 url = 'ws' + this.hass.hassUrl(signature.path).substring(4);
-                if (config.entity)
-                    url += '&entity=' + encodeURIComponent(config.entity);
+                if (src)
+                    url += '&entity=' + encodeURIComponent(src);
                 signalingChannel = new Go2RtcSignalingChannel(url);
             }
             // Integration-level STUN/TURN (config flow): fills the same
@@ -4129,6 +4138,7 @@ class WebRTCbabycam extends HTMLElement {
             "microphone": false,
             "background": false,
             "fullscreen": null,
+            "stream": null,
             "image_url": null,
             "image_entity": null,
             "actions": null,

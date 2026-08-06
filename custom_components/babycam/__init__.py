@@ -49,6 +49,7 @@ CARD_PATH = Path(__file__).parent / "www" / CARD_FILENAME
 OPEN_SCHEMA = vol.Schema(
     {
         vol.Required("entity"): cv.string,
+        vol.Optional("stream"): cv.string,
         vol.Optional("image_entity"): cv.string,
     },
     extra=vol.ALLOW_EXTRA,
