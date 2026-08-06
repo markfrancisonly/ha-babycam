@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.1';
+const CARD_VERSION = '2026.8.2';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -2787,7 +2787,41 @@ class WebRTCbabycam extends HTMLElement {
         );
     }
 
+    // Post-close event shield: closing fullscreen/overlay swaps the DOM under
+    // an ACTIVE gesture — a swipe's residual drag gets re-targeted at whatever
+    // now sits under the finger and scrolls or taps it. A transparent fixed
+    // layer eats all input until the finger lifts (drags keep extending it).
+    static shieldGestures(ms = 700) {
+        const existing = WebRTCbabycam._gestureShield;
+        const shield = existing?.isConnected ? existing : document.createElement('div');
+        if (shield !== existing) {
+            shield.style.cssText =
+                'position:fixed;inset:0;z-index:2147483647;background:transparent;touch-action:none;';
+            const remove = () => {
+                clearTimeout(WebRTCbabycam._gestureShieldTimer);
+                WebRTCbabycam._gestureShieldTimer = undefined;
+                shield.remove();
+            };
+            const arm = (delay) => {
+                clearTimeout(WebRTCbabycam._gestureShieldTimer);
+                WebRTCbabycam._gestureShieldTimer = setTimeout(remove, delay);
+            };
+            shield._arm = arm;
+            const eat = (ev) => { ev.stopPropagation(); ev.preventDefault(); };
+            for (const type of ['pointerdown', 'click', 'contextmenu', 'touchstart'])
+                shield.addEventListener(type, eat, { passive: false });
+            for (const type of ['pointermove', 'touchmove'])
+                shield.addEventListener(type, (ev) => { eat(ev); arm(400); }, { passive: false });
+            for (const type of ['pointerup', 'pointercancel', 'touchend', 'touchcancel'])
+                shield.addEventListener(type, (ev) => { eat(ev); arm(120); }, { passive: false });
+            WebRTCbabycam._gestureShield = shield;
+        }
+        if (!shield.isConnected) document.body.appendChild(shield);
+        shield._arm(ms);
+    }
+
     gestureClose() {
+        WebRTCbabycam.shieldGestures();
         if (this.isInRemoteOverlay) {
             window.babycamOverlay?.close?.();
             return;
