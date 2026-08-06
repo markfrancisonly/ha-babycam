@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.2';
+const CARD_VERSION = '2026.8.3';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -2975,10 +2975,26 @@ class WebRTCbabycam extends HTMLElement {
         container.addEventListener('pointercancel', () => {
             // the engine or host app claimed the drag mid-gesture; in
             // fullscreen nothing legitimately scrolls, so a cancelled drag
-            // with real travel is still the user's swipe
+            // with real travel is still the user's swipe. The finger is still
+            // DOWN here — closing now re-targets the residual drag at the
+            // dashboard the moment :fullscreen unsets (touch-action reverts
+            // and the top layer stops shielding). Dispatch on release.
             if (downPoint && lastPoint && this.gestureContext() === 'fullscreen') {
                 const travel = Math.hypot(lastPoint.x - downPoint.x, lastPoint.y - downPoint.y);
-                if (travel > 60) dispatch('swipe');
+                if (travel > 60) {
+                    let capTimer = null;
+                    const fire = () => {
+                        window.removeEventListener('touchend', fire, true);
+                        window.removeEventListener('touchcancel', fire, true);
+                        window.removeEventListener('pointerup', fire, true);
+                        clearTimeout(capTimer);
+                        dispatch('swipe');
+                    };
+                    window.addEventListener('touchend', fire, true);
+                    window.addEventListener('touchcancel', fire, true);
+                    window.addEventListener('pointerup', fire, true);
+                    capTimer = setTimeout(fire, 1200);   // release signal can be eaten too
+                }
             }
             cancelGesture();
         });
