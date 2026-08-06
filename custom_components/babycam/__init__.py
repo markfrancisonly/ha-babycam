@@ -166,16 +166,15 @@ async def async_setup(hass: HomeAssistant, _config: ConfigType) -> bool:
     """Register integration-wide HTTP, websocket, and frontend resources."""
     integration = await async_get_integration(hass, DOMAIN)
     card = await hass.async_add_executor_job(CARD_PATH.read_bytes)
-    hass.http.register_view(
-        CardView(card, utils.card_etag(integration.version, card))
-    )
+    etag = utils.card_etag(integration.version, card)
+    hass.http.register_view(CardView(card, etag))
     hass.http.register_view(WebSocketView)
     hass.http.register_view(StreamView)
     websocket_api.async_register_command(hass, ws_subscribe)
     websocket_api.async_register_command(hass, ws_config)
 
     async def register_card(hass: HomeAssistant, _component: str) -> None:
-        await utils.async_init_resource(hass, CARD_URL)
+        await utils.async_init_resource(hass, CARD_URL, etag)
 
     async_when_setup(hass, "lovelace", register_card)
     return True

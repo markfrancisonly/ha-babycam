@@ -44,26 +44,26 @@ def card_etag(version: str | None, card: bytes) -> str:
     return f"{version or '0'}-{digest}"
 
 
-async def async_init_resource(hass: HomeAssistant, url: str) -> bool:
-    """Ensure a module entry for ``url`` in the Lovelace resource registry.
+async def async_init_resource(hass: HomeAssistant, url: str, version_tag: str) -> bool:
+    """Ensure a versioned module entry for ``url`` in the resource registry.
 
-    The card is served with ``Cache-Control: no-cache`` and a contract ETag
-    (see ``card_etag``), so the URL needs no version query: browsers
-    revalidate on every dashboard load (cheap 304s) and fetch fresh code
-    after the restart that activated a new backend. Storage-mode dashboards
-    only: in YAML mode the resource list is user-managed, so log the line to
-    add instead.
+    The URL carries ``?v=<contract etag>``: no-cache + ETag alone is not
+    enough — the companion app's service worker serves cached module scripts
+    without revalidating, so only a URL change reliably delivers a new card.
+    Storage-mode dashboards only: in YAML mode the resource list is
+    user-managed, so log the line to add instead.
     """
+    target = f"{url}?v={version_tag}"
     lovelace = hass.data.get("lovelace")
     resources = getattr(lovelace, "resources", None)
 
     if resources is None:
-        _LOGGER.warning("Lovelace resources are unavailable; add '%s' as a module", url)
+        _LOGGER.warning("Lovelace resources are unavailable; add '%s' as a module", target)
         return False
 
     if not hasattr(resources, "async_create_item"):
         _LOGGER.warning(
-            "Lovelace is in YAML mode; add '%s' to your resources as a module", url
+            "Lovelace is in YAML mode; add '%s' to your resources as a module", target
         )
         return False
 
@@ -73,15 +73,14 @@ async def async_init_resource(hass: HomeAssistant, url: str) -> bool:
     for item in resources.async_items():
         if item.get("url", "").split("?", 1)[0] != url:
             continue
-        if item["url"] == url:
+        if item["url"] == target:
             return False
-        # Normalize a versioned ``?v=`` entry left by an earlier release.
         await resources.async_update_item(
-            item["id"], {"res_type": "module", "url": url}
+            item["id"], {"res_type": "module", "url": target}
         )
-        _LOGGER.info("Updated lovelace resource to %s", url)
+        _LOGGER.info("Updated lovelace resource to %s", target)
         return True
 
-    await resources.async_create_item({"res_type": "module", "url": url})
-    _LOGGER.info("Registered lovelace resource %s", url)
+    await resources.async_create_item({"res_type": "module", "url": target})
+    _LOGGER.info("Registered lovelace resource %s", target)
     return True

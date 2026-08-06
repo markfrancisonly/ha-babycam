@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.4';
+const CARD_VERSION = '2026.8.5';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -1797,19 +1797,17 @@ class WebRTCsession {
         this.refreshHass();
 
         try {
+            // Poster priority: explicit override (any entity with an
+            // entity_picture — camera, image, ...) > the entity itself > URL.
             let url = null;
-            if (config.entity && this.hass?.states && this.hass?.connected) {
-                const entity = this.hass.states[config.entity];
-                url = entity?.attributes?.entity_picture;
-            }
-
-            // Poster from a DIFFERENT HA entity than the stream source — for
-            // setups where `entity` is a go2rtc stream name with no HA entity
-            // behind it (e.g. camera.doorbell_sub), so entity_picture above
-            // resolves nothing and the card would sit black until WebRTC.
-            if (!url && config.image_entity && this.hass?.states && this.hass?.connected) {
+            if (config.image_entity && this.hass?.states && this.hass?.connected) {
                 const imageEntity = this.hass.states[config.image_entity];
                 url = imageEntity?.attributes?.entity_picture;
+            }
+
+            if (!url && config.entity && this.hass?.states && this.hass?.connected) {
+                const entity = this.hass.states[config.entity];
+                url = entity?.attributes?.entity_picture;
             }
 
             if (!url && config.image_url) {
@@ -2728,7 +2726,7 @@ class WebRTCbabycam extends HTMLElement {
                 this.setControlsVisibility?.(true);
                 break;
             case 'more_info': {
-                const entityId = this.config?.image_entity || this.config?.entity;
+                const entityId = this.config?.entity;
                 this.dispatchEvent(new CustomEvent('hass-more-info',
                     { bubbles: true, composed: true, detail: { entityId } }));
                 break;
