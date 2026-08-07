@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.6';
+const CARD_VERSION = '2026.8.7';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -2917,7 +2917,10 @@ class WebRTCbabycam extends HTMLElement {
                 return;
             }
 
-            if (travel > 12 || dt >= 600) return;   // drag or slow press, not a tap
+            // tap slop: fingers drift far more than mice — a flat threshold
+            // silently drops real taps on tablets
+            const slop = ev.pointerType === 'mouse' ? 12 : 28;
+            if (travel > slop || dt >= 600) return;   // drag or slow press, not a tap
 
             // Refractory: right after an instant dispatch, the second tap of
             // double-tap muscle memory must not fire the verb again in the
@@ -6980,10 +6983,43 @@ try {
     }
 
     let overlayOnClose = null;
+    let browserFullscreen = false;
+
+    // Desktop bonus: hide the browser chrome around the overlay by
+    // fullscreening the DOCUMENT (programmatic F11) — the overlay stays
+    // ordinary page content inside it (tinted, gesture-owned), nothing rides
+    // the top layer alone. Two gates keep it desktop-only and polite:
+    // capability (hover + fine pointer: mouse-driven browsers, never
+    // tablets/phones) and user activation (a tapped-open overlay has it, a
+    // broadcast babycam.open over the websocket doesn't — so the doorbell
+    // popup can never yank a desktop browser into fullscreen).
+    function enterBrowserFullscreen() {
+        if (!window.matchMedia('(hover: hover) and (pointer: fine)').matches) return;
+        if (document.fullscreenElement ?? document.webkitFullscreenElement) return;
+        const el = document.documentElement;
+        try {
+            const request = el.requestFullscreen ? el.requestFullscreen() : el.webkitRequestFullscreen?.();
+            if (request?.then) {
+                request.then(() => { browserFullscreen = true; }).catch(() => { });
+            }
+        } catch { }
+    }
+
+    function exitBrowserFullscreen() {
+        if (!browserFullscreen) return;
+        browserFullscreen = false;
+        const fs = document.fullscreenElement ?? document.webkitFullscreenElement;
+        if (fs !== document.documentElement) return;
+        try {
+            const exit = document.exitFullscreen ? document.exitFullscreen() : document.webkitExitFullscreen?.();
+            exit?.catch?.(() => { });
+        } catch { }
+    }
 
     function closeOverlay() {
         if (hassPump) { clearInterval(hassPump); hassPump = null; }
         if (overlay) { overlay.remove(); overlay = null; }
+        exitBrowserFullscreen();
         const cb = overlayOnClose;
         overlayOnClose = null;
         try { cb?.(); } catch { }
@@ -7041,6 +7077,7 @@ try {
         // not leave a stale callback for a future close
         overlayOnClose = opts?.onclose ?? null;
         document.body.appendChild(overlay);
+        enterBrowserFullscreen();
 
         // keep the card's hass reference fresh while the overlay lives
         hassPump = setInterval(() => {
