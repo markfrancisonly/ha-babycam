@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.9';
+const CARD_VERSION = '2026.8.10';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -186,6 +186,13 @@ class WebRTCsession {
         }
         if (config.stream) {
             variantParts.push(config.stream);
+        }
+        // start:image cards get their OWN session: sharing one with a
+        // live-first card leaks viewerPaused across views (a parked home
+        // tile leaves the cameras-view live card in the paused gesture
+        // context — single tap stops fullscreening).
+        if (config.start === 'image') {
+            variantParts.push('i');
         }
         const variant = variantParts.join('|');
         let hash = 5381;
