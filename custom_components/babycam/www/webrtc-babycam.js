@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.7';
+const CARD_VERSION = '2026.8.8';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -2142,6 +2142,10 @@ class WebRTCbabycam extends HTMLElement {
                 width: 100%;
                 height: 100%;
                 -webkit-touch-callout: none;
+                /* native image drag / selection abort the pointer stream
+                   mid-gesture (pointerup never fires) */
+                -webkit-user-drag: none;
+                user-select: none;
                 z-index: 1;
             }
             .image[size][timestamp] {
@@ -2842,10 +2846,43 @@ class WebRTCbabycam extends HTMLElement {
         let tapTimer = null;
         let downPoint = null;
         let lastPoint = null;
+        let lastPointerType = '';
 
         const dispatch = (gesture) => {
             const verb = this.gestureFor(gesture);
             if (verb) this.executeGestureAction(verb);
+        };
+
+        // Shared tap/double-tap disambiguation — fed by pointerup for touch
+        // and by native click for mouse.
+        const handleTap = () => {
+            // Refractory: right after an instant dispatch, the second tap of
+            // double-tap muscle memory must not fire the verb again in the
+            // NEW context (open -> instant close, or close -> reopen through
+            // the card now under the finger). Static: the second tap can land
+            // on a DIFFERENT card instance after an overlay close.
+            if (Date.now() < (WebRTCbabycam._tapRefractoryUntil ?? 0)) return;
+
+            const tap = this.gestureFor('tap');
+            const dbl = this.gestureFor('double_tap');
+            if (dbl && dbl !== 'none' && dbl !== tap) {
+                // distinct double-tap configured: tap pays the disambiguation delay
+                if (tapTimer) {
+                    clearTimeout(tapTimer); tapTimer = null;
+                    dispatch('double_tap');
+                    swallowGhostClick();
+                }
+                else {
+                    tapTimer = setTimeout(() => { tapTimer = null; dispatch('tap'); }, 280);
+                }
+            }
+            else {
+                // no double-tap, or double-tap == tap: nothing to disambiguate,
+                // dispatch immediately (fullscreen open/close feels instant)
+                WebRTCbabycam._tapRefractoryUntil = Date.now() + 350;
+                dispatch('tap');
+                swallowGhostClick();
+            }
         };
 
         // A gesture that swaps the DOM under the finger (fullscreen or overlay
@@ -2875,6 +2912,7 @@ class WebRTCbabycam extends HTMLElement {
         container.addEventListener('pointerdown', (ev) => {
             if (!ev.isPrimary || ignores(ev)) return;
             ev.stopPropagation();   // the gesture surface owns this press
+            lastPointerType = ev.pointerType;
             holdFired = false;
             clearTimeout(holdTimer);
             holdTimer = setTimeout(() => { holdFired = true; dispatch('hold'); }, 600);
@@ -2917,38 +2955,17 @@ class WebRTCbabycam extends HTMLElement {
                 return;
             }
 
+            // Mouse taps ride the native click event instead: pointer
+            // synthesis is fragile for mice — native image drag, selection,
+            // and capture all abort the pointer stream, so pointerup never
+            // fires and the tap is silently eaten (2026.7.25 lesson).
+            if (ev.pointerType === 'mouse') return;
+
             // tap slop: fingers drift far more than mice — a flat threshold
             // silently drops real taps on tablets
-            const slop = ev.pointerType === 'mouse' ? 12 : 28;
-            if (travel > slop || dt >= 600) return;   // drag or slow press, not a tap
+            if (travel > 28 || dt >= 600) return;   // drag or slow press, not a tap
 
-            // Refractory: right after an instant dispatch, the second tap of
-            // double-tap muscle memory must not fire the verb again in the
-            // NEW context (open -> instant close, or close -> reopen through
-            // the card now under the finger). Static: the second tap can land
-            // on a DIFFERENT card instance after an overlay close.
-            if (Date.now() < (WebRTCbabycam._tapRefractoryUntil ?? 0)) return;
-
-            const tap = this.gestureFor('tap');
-            const dbl = this.gestureFor('double_tap');
-            if (dbl && dbl !== 'none' && dbl !== tap) {
-                // distinct double-tap configured: tap pays the disambiguation delay
-                if (tapTimer) {
-                    clearTimeout(tapTimer); tapTimer = null;
-                    dispatch('double_tap');
-                    swallowGhostClick();
-                }
-                else {
-                    tapTimer = setTimeout(() => { tapTimer = null; dispatch('tap'); }, 280);
-                }
-            }
-            else {
-                // no double-tap, or double-tap == tap: nothing to disambiguate,
-                // dispatch immediately (fullscreen open/close feels instant)
-                WebRTCbabycam._tapRefractoryUntil = Date.now() + 350;
-                dispatch('tap');
-                swallowGhostClick();
-            }
+            handleTap();
         });
         container.addEventListener('pointercancel', () => {
             // the engine or host app claimed the drag mid-gesture; in
@@ -2981,11 +2998,17 @@ class WebRTCbabycam extends HTMLElement {
         // mobile long-press must not open the browser context menu / image save
         container.addEventListener('contextmenu', (ev) => { ev.preventDefault(); });
 
-        // Gestures are pointer-driven; the synthesized click that follows has
-        // no purpose inside the card and must not surface as a tap on
-        // ancestors (hui wrappers, cards behind an overlay).
+        // Clicks never leave the card (hui wrappers, cards behind an overlay
+        // must not see them as taps). Mouse clicks ALSO drive the tap engine —
+        // native click survives the drag/selection aborts that eat pointerup.
+        // Touch clicks are synthesized ghosts: the pointer path already
+        // handled (and swallowed) them.
         container.addEventListener('click', (ev) => {
-            if (!ignores(ev)) ev.stopPropagation();
+            if (ignores(ev)) return;
+            ev.stopPropagation();
+            if (lastPointerType !== 'mouse') return;
+            if (this.media?.controls) return;   // native controls own the surface
+            handleTap();
         });
     }
 
