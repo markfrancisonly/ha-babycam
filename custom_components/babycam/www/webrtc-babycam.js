@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.5';
+const CARD_VERSION = '2026.8.6';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
@@ -1945,8 +1945,6 @@ class WebRTCbabycam extends HTMLElement {
         this.staleDebounceTimeoutId = undefined;
         this.lastMediaActivityDate = 0;
         this.lastActivitySample = null;
-        this._fullscreenVideoOverride = false;
-        this._fullscreenResumedLive = false;
         this.lastError = null;
     }
 
@@ -2080,20 +2078,6 @@ class WebRTCbabycam extends HTMLElement {
                 /* No double-tap-zoom on the gesture surface (iOS Safari would
                    consume double-taps and delay taps); scrolling still works. */
                 touch-action: manipulation;
-            }
-            /* In native fullscreen the card owns ALL touch gestures: without
-               touch-action:none the browser claims drags for scrolling and
-               pointercancel eats the swipe-to-close before pointerup can see
-               its delta. The remote overlay sets the same thing inline.
-               (Separate rules: an unrecognized selector would invalidate a
-               combined list on the engine that needs the other one.) */
-            :host(:fullscreen) .media-container {
-                touch-action: none;
-                overscroll-behavior: none;
-            }
-            :host(:-webkit-full-screen) .media-container {
-                touch-action: none;
-                overscroll-behavior: none;
             }
             video {
                 visibility: hidden;
@@ -2526,23 +2510,6 @@ class WebRTCbabycam extends HTMLElement {
         `);
     }
 
-    // Native element fullscreen is a stage like the overlay: frame the media
-    // per `fit` (default both = contain), overriding tile presentation such as
-    // renderAspectRatio's cover-crop. Two separate prefix rules — a combined
-    // selector list would be invalidated by the unrecognized one.
-    renderFullscreenFit(fit) {
-        const card = this.shadowRoot.querySelector('.card');
-        if (!card) return;
-        const rules = WebRTCbabycam.fitRules(String(fit ?? 'both').toLowerCase());
-        card.insertAdjacentHTML('beforebegin', `
-        <style>
-            :host(:fullscreen) video, :host(:fullscreen) .image {${rules}}
-            :host(:fullscreen) ha-card, :host(:fullscreen) .media-container { overflow: hidden !important; }
-            :host(:-webkit-full-screen) video, :host(:-webkit-full-screen) .image {${rules}}
-            :host(:-webkit-full-screen) ha-card, :host(:-webkit-full-screen) .media-container { overflow: hidden !important; }
-        </style>
-        `);
-    }
 
     renderStyle(userCardStyle) {
         if (!userCardStyle) return;
@@ -2621,12 +2588,11 @@ class WebRTCbabycam extends HTMLElement {
         fullscreen: { tap: 'close', double_tap: 'close', hold: 'none', swipe: 'close' },
     };
 
-    // Fullscreen/overlay framing rules for a given fit mode. The media keeps
-    // its OWN aspect ratio in every mode; `fit` picks the axis it must fill,
-    // and overflow on the other axis clips symmetrically from the center.
+    // Overlay framing rules for a given fit mode. The media keeps its OWN
+    // aspect ratio in every mode; `fit` picks the axis it must fill, and
+    // overflow on the other axis clips symmetrically from the center.
     // object-fit cannot express per-axis fill, so width/height set element
-    // geometry directly. Shared by the remote overlay stage and the
-    // :host(:fullscreen) style so both fullscreen paths frame identically.
+    // geometry directly.
     static fitRules(fit) {
         if (fit === 'width') {
             return ' position: absolute !important;' +
@@ -2736,22 +2702,18 @@ class WebRTCbabycam extends HTMLElement {
         }
     }
 
+    // "Fullscreen" is ALWAYS the card's own full-viewport overlay — the
+    // browser Fullscreen API is deliberately not used (2026-08-06). The top
+    // layer ignores page-level effects (screen-correction filters), Android
+    // WebViews fight it (pull-to-refresh steals swipes, exit re-targets
+    // in-flight drags), and it needs user activation the tap timers don't
+    // have. The overlay is plain page content: tinted, gesture-owned, mounts
+    // synchronously. Desktop browsers have their own fullscreen mode (F11)
+    // when the monitor is wanted. (The earlier iOS-only overlay tradeoff —
+    // no native AirPlay/PiP affordances — now applies everywhere.)
     gestureFullscreen() {
-        if (this.isInRemoteOverlay) return;   // already effectively fullscreen
+        if (this.isInRemoteOverlay) return;   // already fullscreen
 
-        if (document.fullscreenEnabled || document.webkitFullscreenEnabled) {
-            this.toggleFullScreen();
-            return;
-        }
-
-        // iOS (no element fullscreen API): ALWAYS the card's own
-        // full-viewport overlay, never webkitEnterFullscreen. The native
-        // player owns the screen (no Live indicator, no card controls or
-        // gestures) and pauses the element on close, flashing the paused
-        // state until auto-resume reverses it. Tradeoff accepted 2026-07-29:
-        // the native player's AirPlay/PiP affordances are given up for a
-        // consistent card experience; the overlay also mounts synchronously
-        // inside the gesture and needs no media readiness.
         const session = this.session;
         const resumed = this.config.fullscreen === 'video' && session?.viewerPaused === true;
         if (resumed) {
@@ -2759,8 +2721,13 @@ class WebRTCbabycam extends HTMLElement {
             this.expireConnectingGrace();
         }
         this.trace('fullscreen: full-viewport overlay');
+        // fullscreen:'video' on a video:false card: the overlay card is its
+        // own instance (own session key), so it can simply be given video
+        // rather than mutating the shared session's config.
+        const overlayConfig = { ...this.config };
+        if (this.config.fullscreen === 'video') overlayConfig.video = true;
         window.babycamOverlay?.open?.(
-            { ...this.config },
+            overlayConfig,
             { onclose: resumed ? () => session.setViewerPaused(true) : null }
         );
     }
@@ -2768,7 +2735,7 @@ class WebRTCbabycam extends HTMLElement {
     // fullscreen_live: fullscreen that always shows live video, regardless of
     // the card-level `fullscreen:` option — the per-gesture counterpart to
     // fullscreen: 'video'. Closing reverses the go-live iff this gesture
-    // started it (native exits via fullscreenChanged, overlay via onclose).
+    // started it (overlay onclose).
     gestureFullscreenLive() {
         if (this.isInRemoteOverlay || this.isInFullscreen()) {
             this.gestureClose();
@@ -2780,16 +2747,9 @@ class WebRTCbabycam extends HTMLElement {
             session.setViewerPaused(false);
             this.expireConnectingGrace();
         }
-        if (document.fullscreenEnabled || document.webkitFullscreenEnabled) {
-            if (resumed) this._fullscreenResumedLive = true;
-            this.toggleFullScreen();
-            return;
-        }
-        // no element fullscreen API (iOS WKWebView): the card's own overlay
-        // mounts synchronously and needs no media readiness.
         this.trace('fullscreen_live: full-viewport overlay');
         window.babycamOverlay?.open?.(
-            { ...this.config },
+            { ...this.config, video: true },
             { onclose: resumed ? () => session.setViewerPaused(true) : null }
         );
     }
@@ -2833,8 +2793,16 @@ class WebRTCbabycam extends HTMLElement {
             window.babycamOverlay?.close?.();
             return;
         }
+        // stray native fullscreen (e.g. video element controls) — exit it
         const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
-        if (fsEl) this.toggleFullScreen();
+        if (fsEl) {
+            try {
+                const exit = document.exitFullscreen ? document.exitFullscreen() : document.webkitExitFullscreen?.();
+                exit?.catch?.(err => this.trace(`fullscreen exit: ${err.message}`));
+            } catch (err) {
+                this.trace(`fullscreen exit: ${err.message}`);
+            }
+        }
     }
 
     executeHaAction(a) {
@@ -3037,8 +3005,7 @@ class WebRTCbabycam extends HTMLElement {
         // context) replaces the old hardcoded bindings: image click->fetch,
         // container double-tap->fullscreen and hold->controls now route
         // through config.actions with back-compatible-ish defaults (see
-        // DEFAULT_GESTURES). The iOS video-only fullscreen quirk lives in
-        // gestureFullscreen().
+        // DEFAULT_GESTURES).
         this.bindGestures(container);
 
         if (ptz) {
@@ -4019,91 +3986,6 @@ class WebRTCbabycam extends HTMLElement {
         log.scrollTop = log.scrollHeight;
     }
 
-    toggleFullScreen() {
-        if (!(document.fullscreenEnabled || document.webkitFullscreenEnabled)) return;
-
-        const { session, config } = this;
-
-        // Mutating the shared session.config.video affects every card on the session, so only
-        // apply the fullscreen video upgrade when this card is the sole consumer, and restore
-        // exactly what we changed (tracked per card) rather than hard-setting false on exit.
-        const fullscreenVideo = config.fullscreen === 'video' && config.video === false && !!session;
-        const soleCard = !!session && session.state.cards.size <= 1;
-
-        // Prefix-aware state test: on webkit-prefixed-only engines (iPadOS/macOS Safari
-        // <= 16.3) document.fullscreenElement is always undefined, which would make the
-        // exit branch unreachable - enter would work but exit never.
-        const fullscreenElement = document.fullscreenElement ?? document.webkitFullscreenElement;
-
-        if (!fullscreenElement) {
-            // requestFullscreen returns a promise with several spec-defined rejection
-            // paths (permissions policy, no transient activation); never leave it
-            // unhandled. Rejection is a real path, not just theory: gesture verbs
-            // dispatched from the tap/hold timers run OUTSIDE the user-activation
-            // window, and WebKit rejects activation-less requests that Chrome's 5 s
-            // transient-activation grace still allows. Fall back to the card's own
-            // full-viewport overlay, which needs no activation.
-            try {
-                const request = this.requestFullscreen ? this.requestFullscreen() : this.webkitRequestFullscreen?.();
-                if (request?.catch) {
-                    request.catch(err => {
-                        this.trace(`fullscreen: ${err.message}; falling back to overlay`);
-                        this.openOverlayFallback();
-                    });
-                }
-            } catch (err) {
-                this.trace(`fullscreen: ${err.message}; falling back to overlay`);
-                this.openOverlayFallback();
-            }
-            if (fullscreenVideo && soleCard && session.config.video === false) {
-                this._fullscreenVideoOverride = true;
-                session.config.video = true;
-                session.restartCall();
-            }
-            // fullscreen: 'video' on an image-first card: entering fullscreen
-            // IS the go-live gesture — fullscreen always shows live video.
-            // The snapshot is restored on exit (fullscreenChanged, so Esc and
-            // system exits count) only when this transition started the video.
-            if (config.fullscreen === 'video' && session?.viewerPaused) {
-                this._fullscreenResumedLive = true;
-                session.setViewerPaused(false);
-                this.expireConnectingGrace();
-            }
-        } else {
-            try {
-                const exit = document.exitFullscreen ? document.exitFullscreen() : document.webkitExitFullscreen?.();
-                exit?.catch?.(err => this.trace(`fullscreen: ${err.message}`));
-            } catch (err) {
-                this.trace(`fullscreen: ${err.message}`);
-            }
-            if (fullscreenVideo && this._fullscreenVideoOverride && session.config.video === true) {
-                this._fullscreenVideoOverride = false;
-                session.config.video = false;
-                session.restartCall();
-            }
-        }
-    }
-
-    // Native fullscreen was refused (no transient activation, permissions
-    // policy, ...). No fullscreenchange will ever fire, so consume the state
-    // the enter path staged — the resume flag and the session video override —
-    // and hand the job to the overlay, whose onclose re-parks if entering
-    // fullscreen is what started the video.
-    openOverlayFallback() {
-        const session = this.session;
-        const resumed = this._fullscreenResumedLive === true;
-        this._fullscreenResumedLive = false;
-        if (this._fullscreenVideoOverride && session?.config.video === true) {
-            this._fullscreenVideoOverride = false;
-            session.config.video = false;
-            session.restartCall();
-        }
-        window.babycamOverlay?.open?.(
-            { ...this.config },
-            { onclose: resumed && session ? () => session.setViewerPaused(true) : null }
-        );
-    }
-
     getCardSize() {
         return 5;
     }
@@ -4466,13 +4348,6 @@ class WebRTCbabycam extends HTMLElement {
         // prefix-aware: bare fullscreenElement is undefined on webkit-only
         // engines, which would run the exit path while ENTERING fullscreen
         if (document.fullscreenElement ?? document.webkitFullscreenElement) return;
-        // Restore the snapshot when leaving fullscreen ONLY if entering it is
-        // what started the video (fullscreen: 'video' on an image-first
-        // card). Runs here so Esc and system exits count, not just gestures.
-        if (this._fullscreenResumedLive) {
-            this._fullscreenResumedLive = false;
-            this.session?.setViewerPaused?.(true);
-        }
         const pending = this._pendingVisibility;
         this._pendingVisibility = null;
         if (pending == null || this.isVisibleInViewport === pending) return;
@@ -4594,7 +4469,6 @@ class WebRTCbabycam extends HTMLElement {
             this.renderPTZ(hasMove, hasZoom, hasHome, hasVol, hasMic);
             this.renderShortcuts(shortcuts);
             this.renderAspectRatio(config.aspect_ratio);
-            this.renderFullscreenFit(config.fit);
             this.renderStyle(userCardStyle);
             this.renderInteractionEventListeners();
             this.rendered = true;

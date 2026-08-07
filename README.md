@@ -92,8 +92,8 @@ first log line shows the loaded version.
 | **muted** | `boolean` | `true` | `true`, `false` | Mute the player element on load. If `false`, the player attempts to play with audio enabled, but browsers often require user interaction to unmute. |
 | **microphone** | `boolean` | `false` | `true`, `false` | Enable *two-way audio* from the user’s microphone to the camera feed if the browser permits. |
 | **background** | `boolean` | `false` | `true`, `false` | If `true`, enables "background mode," where the audio continues to play when off-screen. |
-| **fit** | `string` | `both` | `both`, `width`, `height` | Fullscreen/overlay framing. Media always keeps its own aspect ratio, centered; `fit` picks the axis it must fill — `both` letterboxes (contain), `width`/`height` fill that axis and crop the other symmetrically from the center. Applies to native element fullscreen and the overlay alike; `babycam.open` accepts the same key per call. |
-| **fullscreen** | `string` | (optional)  | `"video"`, `null` | `"video"` makes fullscreen always show live video: on a `video: false` card the fullscreen call is upgraded to video, and on a `start: image` card entering fullscreen goes live (the snapshot is restored on exit if fullscreen is what started the video). Omit it to let snapshot cards go fullscreen as a static image. |
+| **fit** | `string` | `both` | `both`, `width`, `height` | Fullscreen-overlay framing. Media always keeps its own aspect ratio, centered; `fit` picks the axis it must fill — `both` letterboxes (contain), `width`/`height` fill that axis and crop the other symmetrically from the center. `babycam.open` accepts the same key per call. |
+| **fullscreen** | `string` | (optional)  | `"video"`, `null` | `"video"` makes fullscreen always show live video: the overlay card is opened with video enabled, and on a `start: image` card entering fullscreen goes live (the snapshot is restored on close if fullscreen is what started the video). Omit it to let snapshot cards go fullscreen as a static image. |
 | **debug** | `boolean` | `false` | `true`, `false` | Enables verbose logging. Shows a translucent debug panel capturing debug/tracing messages. |
 | **stats** | `boolean` | `false` | `true`, `false` | Enables measurement and display of streaming stats (e.g., framerate, bandwidth). |
 | **allow_background** | `boolean` | `false` | `true`, `false` | If `true`, allows toggling the “pin” icon to enable background mode. |
@@ -139,7 +139,11 @@ Gestures are configurable per **context** — what the card is currently showing
 - `image` — natively snapshot mode (still connecting, or video/audio disabled)
 - `live` — WebRTC streaming
 - `paused` — viewer tapped a live card into image mode (`toggle_live`/`go_image`)
-- `fullscreen` — native element fullscreen **or** the remote overlay
+- `fullscreen` — the card's full-viewport overlay (the fullscreen verbs never
+  use the browser Fullscreen API: the top layer ignores page-level effects
+  like screen-correction filters, mobile engines fight it, and it needs user
+  activation the tap timers don't have — use the browser's own fullscreen
+  mode, e.g. F11, when the monitor is wanted)
 
 Gestures: `tap`, `double_tap`, `hold` everywhere, plus `swipe` (any direction)
 in fullscreen only (embedded swipes would fight dashboard scrolling).
@@ -171,14 +175,9 @@ and double-tap fullscreens; inside fullscreen any tap or swipe closes. Starting
 video is always an explicit config choice (`toggle_live`, `go_live`,
 `fullscreen_live`), never a default single tap.
 
-Notes: taps pay a ~280 ms disambiguation delay only in contexts where a
-`double_tap` is configured; single-tap and hold verbs therefore dispatch from a
-timer, outside the browser's user-activation window — if the engine refuses
-`requestFullscreen()` there (WebKit does), the card falls back to its own
-full-viewport overlay; on engines with no element-fullscreen API at all
-(iPhone Safari, iOS companion app) every fullscreen verb uses the card
-overlay — never the native video player, which has no Live indicator or card
-controls and pauses the element on close; gestures stand down while native
+Notes: taps pay a ~280 ms disambiguation delay only in contexts where the
+`tap` and `double_tap` verbs differ (same-verb taps dispatch instantly);
+gestures stand down while native
 video controls are visible; `toggle_live` is session-scoped (cards sharing a
 stream pause and resume together) and keeps the snapshot loop polling while
 paused.
