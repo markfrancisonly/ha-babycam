@@ -1,7 +1,7 @@
 // Bump on every release: stale cached card code is the most common cause of "it still
 // misbehaves" reports on wall tablets - the console banner, the in-card debug log, and
 // the dock tooltip all surface this value so a fresh load is a one-glance check.
-const CARD_VERSION = '2026.8.10';
+const CARD_VERSION = '2026.9.0';
 
 console.info(
     `%c  WebRTC Babycam %c v${CARD_VERSION} `,
